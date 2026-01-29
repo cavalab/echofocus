@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-"""
-@author: Platon Lukyanenko & William La Cava
-"""
+"""Process batches to generate clip embeddings."""
+
+# Authors: Platon Lukyanenko, William La Cava
 
 import time
 
@@ -50,10 +50,16 @@ Test_Transforms = torch.nn.Sequential(
 
 
 def pull_clips(file_loc, transform_func, num_clips=16):
-    """stacks clips into a tensor
-    from PanECHO
-    """
+    """Sample multiple random clips from a video and stack them.
 
+    Args:
+        file_loc (str): Path to a video file.
+        transform_func (callable): Transform pipeline for clips.
+        num_clips (int): Number of clips to sample.
+
+    Returns:
+        torch.Tensor: Stacked clips with shape (num_clips, 1, 3, 16, 224, 224).
+    """
     # capture = cv2.VideoCapture(file_loc) # pull the file once, instead of x16...
 
     a = [pull_clip(file_loc, transform_func) for k in range(num_clips)]
@@ -62,8 +68,14 @@ def pull_clips(file_loc, transform_func, num_clips=16):
 
 
 def pull_clip(file_loc, transform_func):
-    """pulls a random 16-frame clip, following PanEcho code, returns it
-    from PanEcho
+    """Sample a random 16-frame clip and apply transforms.
+
+    Args:
+        file_loc (str): Path to a video file.
+        transform_func (callable): Transform pipeline for clips.
+
+    Returns:
+        torch.Tensor: Clip tensor shaped (1, 3, 16, 224, 224).
     """
     capture = cv2.VideoCapture(file_loc)
     clip_len = 16
@@ -108,19 +120,45 @@ def pull_clip(file_loc, transform_func):
 
 
 class MyDataset(Dataset):
+    """Dataset of video file paths and transforms."""
+
     def __init__(self, path_list, transforms):
+        """Initialize dataset of video file paths.
+
+        Args:
+            path_list (list[str]): Video file paths.
+            transforms (callable): Transform pipeline for clips.
+        """
         self.path_list = path_list
         self.transforms = transforms
 
     def __len__(self):
+        """Return number of files in the dataset."""
         return len(self.path_list)
 
     def __getitem__(self, idx):
+        """Return stacked clips and file path for an index.
+
+        Args:
+            idx (int): Dataset index.
+
+        Returns:
+            tuple[torch.Tensor, str]: Clips tensor and file path.
+        """
         return pull_clips(self.path_list[idx], self.transforms), self.path_list[idx]
 
 def main(
     batch_num, out_dir="./out_loc", seed=0, train_transforms=False, parallel_count=8
 ):
+    """Process a batch of trim folders into embedding files.
+
+    Args:
+        batch_num (int): Batch ID to process.
+        out_dir (str): Output directory containing batch files and folders.
+        seed (int): RNG seed for reproducibility.
+        train_transforms (bool): Use training transforms if True.
+        parallel_count (int): Number of parallel workers for the dataloader.
+    """
     np.random.seed(seed)
     random.seed(seed)
     torch.manual_seed(seed)

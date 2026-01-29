@@ -1,13 +1,29 @@
+"""Model architectures for EchoFocus."""
+
 import torch
 from torch import nn
 
 class CustomDropout(nn.Module):
-    """custom dropout class (largely from chat_gpt)"""
+    """Custom dropout that drops entire clip embeddings."""
+
     def __init__(self, p):
+        """Initialize the dropout module.
+
+        Args:
+            p (float): Dropout probability for entire clip embeddings.
+        """
         super().__init__()
         self.p = p
 
     def forward(self, x):
+        """Apply dropout by dropping entire clip rows during training.
+
+        Args:
+            x (torch.Tensor): Input tensor shaped (B, T, D).
+
+        Returns:
+            torch.Tensor: Tensor with some rows removed in training mode.
+        """
         if self.training:  # apply dropout only during training
             row_keep_mask = (
                 torch.rand(x.shape[1]) > self.p
@@ -18,8 +34,20 @@ class CustomDropout(nn.Module):
         else:
             return x
 class CustomTransformer(nn.Module):
+    """Transformer encoder over clip embeddings with pooling."""
+
     # if n_layers = 0 -> MHA
     def __init__ (self, input_size=768, encoder_dim=768, n_encoder_layers=0, output_size=1, clip_dropout = 0, tf_combine = 'avg'):
+        """Initialize the transformer model for clip embeddings.
+
+        Args:
+            input_size (int): Input embedding dimension.
+            encoder_dim (int): Feed-forward dimension in the encoder.
+            n_encoder_layers (int): Number of transformer encoder layers.
+            output_size (int): Number of output targets.
+            clip_dropout (float): Dropout probability for clip embeddings.
+            tf_combine (str): Pooling method: ``"avg"`` or ``"max"``.
+        """
         super(CustomTransformer, self).__init__()
         
         self.clip_dropout = CustomDropout(clip_dropout)
@@ -36,6 +64,14 @@ class CustomTransformer(nn.Module):
         self.ff = nn.Linear(in_features = encoder_dim, out_features = output_size) 
 
     def embed(self, x):
+        """Return pooled encoder representation for a set of clips.
+
+        Args:
+            x (iterable[torch.Tensor]): Sequence of clip embeddings.
+
+        Returns:
+            torch.Tensor: Pooled representation vector.
+        """
         x = torch.vstack([k for k in x]) # combine the tensors for all the videos
         x = x.unsqueeze(0)
         # y = x.squeeze()
@@ -55,7 +91,14 @@ class CustomTransformer(nn.Module):
         return out
 
     def forward(self, x):
-        
+        """Compute model outputs for a set of clips.
+
+        Args:
+            x (iterable[torch.Tensor]): Sequence of clip embeddings.
+
+        Returns:
+            torch.Tensor: Output logits or regression values.
+        """
         x = torch.vstack([k for k in x]) # combine the tensors for all the videos
         x = x.unsqueeze(0)
         # y = x.squeeze()
@@ -77,6 +120,8 @@ class CustomTransformer(nn.Module):
         return linear_out
         
 class CustomQueryTransformer(nn.Module):
+    """Transformer with a learned query token for set pooling."""
+
     def __init__(
         self,
         input_size=768,
@@ -86,6 +131,16 @@ class CustomQueryTransformer(nn.Module):
         clip_dropout=0,
         n_heads=6,
     ):
+        """Initialize a query-token transformer for set pooling.
+
+        Args:
+            input_size (int): Input embedding dimension.
+            encoder_dim (int): Feed-forward dimension in the encoder layer.
+            n_encoder_layers (int): Number of encoder layers.
+            output_size (int): Number of output targets.
+            clip_dropout (float): Dropout probability for clip embeddings.
+            n_heads (int): Number of attention heads.
+        """
         super().__init__()
 
         self.clip_dropout = CustomDropout(clip_dropout)
@@ -121,9 +176,13 @@ class CustomQueryTransformer(nn.Module):
         self.ff = nn.Linear(in_features=ff_in_dim, out_features=output_size)
 
     def forward(self, x):
-        """
-        x: iterable/list of video embeddings, each shape (D,)
-           (your original code used vstack; stack is a bit clearer here)
+        """Compute model outputs for a set of video embeddings.
+
+        Args:
+            x (iterable[torch.Tensor]): Video embeddings shaped (D,).
+
+        Returns:
+            torch.Tensor: Output logits or regression values.
         """
         # (n_videos, D)
         # x = torch.stack(list(x), dim=0)
@@ -196,4 +255,3 @@ class CustomQueryTransformer(nn.Module):
 #         linear_out = self.ff(out)
 
 #         return linear_out
-

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-"""
-Main entry point for training and evaluating EchoFocus models
+"""Main entry point for training and evaluating EchoFocus models.
+
 Authors: Platon Lukyanenko, William La Cava
 """
 
@@ -33,6 +33,8 @@ from models import CustomTransformer
 
 
 class EchoFocus:
+    """Train, evaluate, and explain EchoFocus models."""
+
     @utils.initializer  # this decorator automatically sets arguments to class attributes.
     def __init__(
         self,
@@ -58,6 +60,31 @@ class EchoFocus:
         config='config.json',
         cache_embeddings=False
     ):
+        """Initialize training/evaluation state and load config.
+
+        Args:
+            model_name (str|None): Name for the model run directory.
+            dataset (str|None): Dataset key in the config file.
+            task (str): Task key in the config file.
+            seed (int): RNG seed for reproducibility.
+            batch_number (int): Gradient accumulation steps.
+            batch_size (int): Batch size (only 1 supported).
+            epoch_lim (int): Max epochs to train; -1 for eval-only.
+            epoch_early_stop (int): Early stopping patience in epochs.
+            learning_rate (float): Optimizer learning rate.
+            encoder_depth (int): Number of transformer encoder layers.
+            clip_dropout (float): Dropout probability for clip embeddings.
+            tf_combine (str): Pooling method for transformer output.
+            debug_echo_folder (bool): Debug flag for local echo folder.
+            laptop_debug (bool): Debug flag for local laptop use.
+            test_only (bool): If True, run evaluation only.
+            parallel_processes (int): Number of dataloader workers.
+            sample_limit (int): Limit number of samples.
+            preload_embeddings (bool): Deprecated preload mode.
+            run_id (str|None): Optional run ID for reproducibility.
+            config (str): Path to config JSON file.
+            cache_embeddings (bool): Cache embeddings in memory.
+        """
         self.time = time.time()
         self.datetime = str(datetime.now()).replace(" ", "_")
         if run_id:
@@ -113,6 +140,12 @@ class EchoFocus:
         self._set_loss()
 
     def _load_config(self):
+        """Load dataset/task config and set instance attributes.
+
+        Raises:
+            ValueError: If dataset is not defined in the config.
+            AssertionError: If task is not defined in the config.
+        """
         with open(self.config,'r') as f:
             data = json.load(f)
 
@@ -126,7 +159,7 @@ class EchoFocus:
             setattr(self,k,v)
 
     def save(self):
-        """Save parameters of run to a json file."""
+        """Save run parameters to ``cfg.json`` in the run directory."""
         self.time = time.time() - self.time
         save_name = f"{self.save_dir}/{self.run_id}/cfg.json"
         with open(save_name, "w") as of:
@@ -139,7 +172,14 @@ class EchoFocus:
             json.dump(payload, of, indent=4)
 
     def _setup_data(self, input_norm_dict=None):
+        """Prepare dataloaders and normalization metadata.
 
+        Args:
+            input_norm_dict (dict|None): Existing normalization parameters.
+
+        Returns:
+            tuple: (train_dataloader, valid_dataloader, test_dataloader, input_norm_dict)
+        """
         csv_data = pd.read_csv(self.label_path) # pull labels from local path
         csv_data = csv_data.drop_duplicates() # I don't know why there are duplicates, but there are...
         Embedding_EchoID_List = [int(k.split('_')[0]) for k in os.listdir(self.embedding_path)]
@@ -289,6 +329,11 @@ class EchoFocus:
     # def _normalize_data(self):
 
     def _setup_model(self):
+        """Initialize model, optimizer, scheduler, and load checkpoints.
+
+        Returns:
+            tuple: (model, current_epoch, best_epoch, best_loss, input_norm_dict)
+        """
         # 5. Set up folders and save training args
         self.last_checkpoint_path = os.path.join(self.model_path, 'last_checkpoint.pt') 
         self.best_checkpoint_path = os.path.join(self.model_path, 'best_checkpoint.pt') 
@@ -363,7 +408,11 @@ class EchoFocus:
 
     @utils.initializer
     def train(self,split=(64,16,20)):
-        """Generate predictions on a dataset"""
+        """Train the model and evaluate on train/val/test splits.
+
+        Args:
+            split (tuple[int, int, int]): Train/val/test percent split.
+        """
         model, current_epoch, best_epoch, best_loss, input_norm_dict = self._setup_model()
         train_dataloader, val_dataloader, test_dataloader, input_norm_dict = self._setup_data(input_norm_dict)        
         
@@ -469,6 +518,14 @@ class EchoFocus:
             self._evaluate(best_model, dataloader, fold, input_norm_dict)
 
     def _evaluate(self, model, dataloader, fold, input_norm_dict=None):
+        """Evaluate a model on a dataloader and write outputs.
+
+        Args:
+            model (torch.nn.Module): Trained model.
+            dataloader (torch.utils.data.DataLoader): Dataloader for a split.
+            fold (str): Split name (train/val/test).
+            input_norm_dict (dict|None): Normalization parameters.
+        """
         if dataloader is None or len(dataloader)==0:
             print('skipping',fold)
             return
@@ -504,8 +561,7 @@ class EchoFocus:
         
             
     def evaluate(self):
-        """Generate predictions on a dataset"""
-
+        """Evaluate the best checkpoint on train/val/test splits."""
         # 10. Compute performance 
         eval_start_time = time.time()
         # model = self._setup_model() 
@@ -522,6 +578,7 @@ class EchoFocus:
             print('eval time taken: ', time.time() - eval_start_time)
 
     def _set_loss(self):
+        """Set the loss function based on task type."""
         if self.task=='measure':
             self.loss_fn = utils.masked_mse_loss
         elif self.task in ['chd','fyler']:
@@ -529,8 +586,11 @@ class EchoFocus:
 
     @utils.initializer
     def embed(self, embed_file=None, split=(0,0,100)):
-        """Generate embeddings
-        TODO: add clip-level embedding option
+        """Generate and save embedding vectors for each study.
+
+        Args:
+            embed_file (str|None): Output HDF5 path; defaults to model directory.
+            split (tuple[int, int, int]): Train/val/test split (unused).
         """
         model,_,_,_,_ = self._setup_model() 
         best_checkpoint_path = os.path.join(self.model_path, 'best_checkpoint.pt') 
@@ -561,6 +621,15 @@ class EchoFocus:
         explain_tasks = ('EF05','AR01'),
         split=(0,0,100)
     ):
+        """Generate integrated gradients explanations and save to CSV.
+
+        Args:
+            explain (bool): Unused flag for CLI compatibility.
+            explain_n (int): Number of top videos to record per sample.
+            explain_mode (str): Objective mode for IG ("pred" or "loss").
+            explain_tasks (tuple[str]|str): Tasks to explain.
+            split (tuple[int, int, int]): Train/val/test split (unused).
+        """
         from integrated_gradients import integrated_gradients_video_level
         if isinstance(self.explain_tasks,str):
             if self.explain_tasks.lower() == 'all':
@@ -719,6 +788,7 @@ class EchoFocus:
         print('saved explanations to',os.path.join(self.model_path, explain_file_name))
 
     def save_log(self):
+        """Write the training loss log to CSV."""
         # save model runtime and loss as csv
         with open(self.log_path, "w", newline="") as f:
             writer = csv.writer(f)
@@ -729,6 +799,16 @@ class EchoFocus:
 
 
 def save_nn(model, path, perf_log, optimizer=None, scheduler=None, input_norm_dict=None):
+    """Save a model checkpoint to disk.
+
+    Args:
+        model (torch.nn.Module): Model to save.
+        path (str): Checkpoint path.
+        perf_log (list[list]): Training log entries.
+        optimizer (torch.optim.Optimizer|None): Optimizer state to save.
+        scheduler (torch.optim.lr_scheduler._LRScheduler|None): Scheduler state to save.
+        input_norm_dict (dict|None): Normalization parameters.
+    """
     # https://pytorch.org/tutorials/recipes/recipes/saving_and_loading_a_general_checkpoint.html
     # best_performance_measure refers to the performance of the best model so far
     # so we don't accidentally overwrite it
@@ -754,6 +834,17 @@ def save_nn(model, path, perf_log, optimizer=None, scheduler=None, input_norm_di
 
 
 def load_model_and_random_state(path, model, optimizer=None, scheduler=None):
+    """Load a checkpoint and restore model and RNG state.
+
+    Args:
+        path (str): Checkpoint path.
+        model (torch.nn.Module): Model to load weights into.
+        optimizer (torch.optim.Optimizer|None): Optimizer to restore.
+        scheduler (torch.optim.lr_scheduler._LRScheduler|None): Scheduler to restore.
+
+    Returns:
+        tuple: (model, optimizer, scheduler, perf_log, input_norm_dict)
+    """
     # input: .pt location
     # do: pull model, pull training progress, set random states
     # output: model, training progress
@@ -865,6 +956,16 @@ def load_model_and_random_state(path, model, optimizer=None, scheduler=None):
 #     return preds, labels, eids_all, mean_loss
 
 def run_model_on_dataloader(model, dataloader, loss_func_pointer):
+    """Run inference on a dataloader and collect outputs.
+
+    Args:
+        model (torch.nn.Module): Model to evaluate.
+        dataloader (torch.utils.data.DataLoader): Dataloader to iterate.
+        loss_func_pointer (callable): Loss function to compute per batch.
+
+    Returns:
+        tuple: (model_outputs, correct_outputs, echo_ids, total_loss)
+    """
     # runs model on dataloader, measuring loss and returning  correct and output values and pid (folder) and loss
 
     model.eval()

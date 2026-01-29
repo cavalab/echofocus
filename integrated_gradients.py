@@ -1,18 +1,32 @@
+"""Integrated gradients utilities for video-level attributions."""
+
 import torch
 import torch.nn.functional as F
 
 @torch.no_grad()
 def _infer_device(model):
+    """Infer the device of a model from its parameters.
+
+    Args:
+        model (torch.nn.Module): Model to inspect.
+
+    Returns:
+        torch.device: Device of the first parameter, or CPU if none exist.
+    """
     try:
         return next(model.parameters()).device
     except StopIteration:
         return torch.device("cpu")
 
 def _forward_from_video_tensor(model, x_tensor):
-    """
-    x_tensor: (N, D) tensor
-    model expects list of tensors; convert back.
-    Returns: (T,) outputs (logits for classification; preds for regression)
+    """Run the model on stacked video embeddings.
+
+    Args:
+        model (torch.nn.Module): Model that expects a list of tensors.
+        x_tensor (torch.Tensor): Stacked embeddings with shape (N, D).
+
+    Returns:
+        torch.Tensor: Output vector with shape (T,).
     """
     x_list = [x_tensor[i] for i in range(x_tensor.shape[0])]
     out = model(x_list)

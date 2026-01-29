@@ -1,6 +1,6 @@
-"""
-authors: Platon Lukanenko, Bohan Jiang, William La Cava
-"""
+"""Create batch CSVs for embedding processing."""
+
+# Authors: Platon Lukanenko, Bohan Jiang, William La Cava
 
 import os
 import pandas as pd 
@@ -10,7 +10,12 @@ def main(
     batch_size=20,
     out_dir='./out_dir'
     ):
-    
+    """Create batch CSVs listing work items.
+
+    Args:
+        batch_size (int): Number of trim folders per batch file.
+        out_dir (str): Base output directory created by setup step.
+    """
     # set up csvs
     trim_folders = os.listdir(os.path.join(out_dir,'Incomplete'))
     trim_folders=[k[:-4] for k in trim_folders]
@@ -25,4 +30,3 @@ def main(
 import fire
 if __name__ == '__main__':
     fire.Fire(main)
-

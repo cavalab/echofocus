@@ -1,6 +1,6 @@
-"""
-authors: Platon Lukanenko, Bohan Jiang, William La Cava
-"""
+"""Set up batch-processing folders for embedding generation."""
+
+# Authors: Platon Lukanenko, Bohan Jiang, William La Cava
 
 import os
 import pandas as pd 
@@ -12,6 +12,12 @@ def main(
     src_dir,
     out_dir='./out_dir',
 ):
+    """Create batch-processing folder structure for embeddings.
+
+    Args:
+        src_dir (str): Source directory containing trim folders.
+        out_dir (str): Output directory to initialize.
+    """
     if os.path.exists(out_dir):
         answer = (
             input(
@@ -46,4 +52,3 @@ def main(
 
 if __name__ == '__main__':
     fire.Fire(main)
-

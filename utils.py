@@ -1,3 +1,5 @@
+"""Utility functions for normalization, plotting, and reproducibility."""
+
 import os
 import numpy as np
 import scipy
@@ -7,6 +9,18 @@ from functools import wraps
 import matplotlib.pyplot as plt
 
 def get_norm_params(train_df, measure_list):
+    """Compute per-measure normalization parameters for label transforms.
+
+    The transform shifts each measure, optionally applies Box-Cox, then stores
+    mean and standard deviation for z-scoring.
+
+    Args:
+        train_df: Pandas DataFrame with training labels.
+        measure_list: Iterable of column names to normalize.
+
+    Returns:
+        dict: Mapping of measure name to normalization parameters.
+    """
     input_norm_dict = {}
     input_norm_dict['type'] = 'boxcox'
     
@@ -45,6 +59,15 @@ def get_norm_params(train_df, measure_list):
     return input_norm_dict
 
 def normalize_df(target_df, input_norm_dict):
+    """Apply saved normalization parameters to a dataframe.
+
+    Args:
+        target_df: Pandas DataFrame to normalize.
+        input_norm_dict: Dict produced by :func:`get_norm_params`.
+
+    Returns:
+        pandas.DataFrame: Normalized copy of ``target_df``.
+    """
     # requires input_norm_dict from get_norm_params
     out_df = target_df.copy() # I think this is the preferred way to change a dataframe?
     keys = [key for key in input_norm_dict.keys()]
@@ -62,10 +85,29 @@ def normalize_df(target_df, input_norm_dict):
             out_df[measure] = values
     return out_df 
 def masked_mse_loss(Model_Out, Correct_Out): # SSE
-        not_nan_mask = ~Correct_Out.isnan().squeeze() # only calculate loss for not-nan-entries
-        return torch.nn.functional.mse_loss(Model_Out[not_nan_mask].squeeze(),Correct_Out[not_nan_mask].squeeze())*sum(not_nan_mask) # and we want SSE, not MSE
+    """Compute sum of squared errors while ignoring NaN targets.
+
+    Args:
+        Model_Out (torch.Tensor): Model outputs.
+        Correct_Out (torch.Tensor): Target outputs with possible NaNs.
+
+    Returns:
+        torch.Tensor: Scalar SSE over non-NaN entries.
+    """
+    not_nan_mask = ~Correct_Out.isnan().squeeze() # only calculate loss for not-nan-entries
+    return torch.nn.functional.mse_loss(Model_Out[not_nan_mask].squeeze(),Correct_Out[not_nan_mask].squeeze())*sum(not_nan_mask) # and we want SSE, not MSE
 
 def un_normalize_output(output, measure_list, input_norm_dict):
+    """Invert normalization on model outputs.
+
+    Args:
+        output (numpy.ndarray or torch.Tensor): Normalized outputs shaped (N, T) or (T,).
+        measure_list: Iterable of measure names in output order.
+        input_norm_dict: Dict produced by :func:`get_norm_params`.
+
+    Returns:
+        numpy.ndarray or torch.Tensor: Un-normalized outputs with original scale.
+    """
     if len(output.shape) == 1:
         output = output.reshape(1,-1)
     assert output.shape[1] == len(measure_list)
@@ -103,7 +145,7 @@ def un_normalize_output(output, measure_list, input_norm_dict):
 
 def initializer(func):
     """
-    Automatically assigns the parameters.
+    Assign ``__init__`` args to instance attributes.
 
     >>> class process:
     ...     @initializer
@@ -112,6 +154,12 @@ def initializer(func):
     >>> p = process('halt', True)
     >>> p.cmd, p.reachable, p.user
     ('halt', True, 'root')
+
+    Args:
+        func (callable): Initializer to wrap.
+
+    Returns:
+        callable: Wrapped initializer that sets attributes before running.
     """
     # names, varargs, keywords, defaults = inspect.getargspec(func)
     names, varargs, keywords, defaults, _,_,_ = inspect.getfullargspec(func)
@@ -129,6 +177,11 @@ def initializer(func):
     return wrapper
 
 def load_random_state(import_dict):
+    """Restore numpy/torch RNG state from a checkpoint dict.
+
+    Args:
+        import_dict (dict): Checkpoint dictionary with RNG state entries.
+    """
     if ( ('Numpy_Random_State' in import_dict.keys()) and ('Torch_Random_State' in import_dict.keys()) ):
         np.random.set_state(import_dict['Numpy_Random_State'])
         torch.random.set_rng_state(import_dict['Torch_Random_State'])
@@ -141,9 +194,27 @@ def load_random_state(import_dict):
         print('Could not load random state')
 
 def sigmoid(z):
+    """Compute the logistic sigmoid of ``z``.
+
+    Args:
+        z (numpy.ndarray or float): Input value(s).
+
+    Returns:
+        numpy.ndarray or float: Sigmoid-transformed values.
+    """
     return 1/(1 + np.exp(-z))
 
 def scatter_plots(model_path, dataset, fold, task_labels, y_true, y_pred):
+    """Save scatter plots comparing predicted vs. true labels.
+
+    Args:
+        model_path (str): Output directory for plots.
+        dataset (str): Dataset name for file labeling.
+        fold (str): Split name (e.g., train/val/test).
+        task_labels (list[str]): Task label names.
+        y_true (numpy.ndarray): Ground-truth values.
+        y_pred (numpy.ndarray): Predicted values.
+    """
     # draw scatterplot with 1:1 dashed line on diagonal
     figure_loc = os.path.join(model_path, f'scatter_plots_{fold}_{dataset}.pdf')
     fig, ax = plt.subplots(3,6,figsize=(20,10))
@@ -164,6 +235,12 @@ def scatter_plots(model_path, dataset, fold, task_labels, y_true, y_pred):
     fig.savefig(figure_loc, bbox_inches = 'tight')
 
 def plot_training_progress(model_path, perf_log):
+    """Save a training/validation loss plot.
+
+    Args:
+        model_path (str): Output directory for the plot.
+        perf_log (list[list]): Rows of [epoch, train_loss, val_loss, lr, epoch_time].
+    """
     figure_loc = os.path.join(model_path, 'training_progress.pdf')
     f = plt.figure() # https://stackoverflow.com/questions/11328958/save-multiple-plots-in-a-single-pdf-file
     epochs      = [k[0] for k in perf_log]
