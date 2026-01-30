@@ -210,14 +210,14 @@ class EchoFocusEndToEnd(nn.Module):
                     video_emb = checkpoint(self.panecho, video_clips)
             else:
                 video_emb = self.panecho(video_clips)
-            self._mem(f"idx={idx} panecho after")
             embeddings.append(video_emb)
         return torch.stack(embeddings, dim=0)
 
     def forward(self, clips):
         """Compute outputs from raw clips."""
+        self._mem("panecho before")
         embeddings = self._panecho_embed(clips)
-        self._mem("transformer before")
+        self._mem("panecho after, transformer before")
         embeddings= self.transformer(embeddings)
         self._mem("transformer after")
         return embeddings
