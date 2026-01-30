@@ -71,6 +71,8 @@ class EchoFocus:
         smoke_num_samples=8,
         smoke_num_steps=2,
         debug_mem=False,
+        amp=False,
+        checkpoint_panecho=False,
     ):
         """Initialize training/evaluation state and load config.
 
@@ -107,6 +109,8 @@ class EchoFocus:
             smoke_num_samples (int): Number of samples for smoke training.
             smoke_num_steps (int): Number of batches per epoch for smoke training.
             debug_mem (bool): If True, print CUDA memory stats for first batch each epoch.
+            amp (bool): If True, use autocast + GradScaler mixed precision.
+            checkpoint_panecho (bool): If True, checkpoint PanEcho forward to save memory.
         """
         self.time = time.time()
         self.datetime = str(datetime.now()).replace(" ", "_")
@@ -464,6 +468,7 @@ class EchoFocus:
                 tf_combine="avg",
                 panecho_trainable=self.panecho_trainable,
                 debug_mem=self.debug_mem,
+                checkpoint_panecho=self.checkpoint_panecho,
             )
         else:
             self.model = CustomTransformer(
@@ -484,9 +489,12 @@ class EchoFocus:
     
         if (torch.cuda.is_available()):
             self.model = self.model.to('cuda')
+        elif self.amp:
+            print("WARNING: amp=True requested but CUDA is not available; running in full precision on CPU.")
 
         
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr = self.learning_rate, weight_decay = 0.01)
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.amp)
         # add the scheduler
         patience = 3
         lr_factor = 0.5
@@ -580,40 +588,60 @@ class EchoFocus:
                     
                 if self.debug_mem and batch_count == 0:
                     _mem("before forward")
-                out = self.model(Embedding)
+                with torch.cuda.amp.autocast(enabled=self.amp):
+                    out = self.model(Embedding)
+                    train_loss = self.loss_fn(out, Correct_Out)
                 if self.debug_mem and batch_count == 0:
                     _mem("after forward")
-                
-                train_loss = self.loss_fn(out, Correct_Out)
                 if self.debug_mem and batch_count == 0:
                     _mem("after loss")
                 # train_loss = Loss_Func(out, Correct_lvef)
-                train_loss.backward()
+                if self.amp:
+                    self.scaler.scale(train_loss).backward()
+                else:
+                    train_loss.backward()
                 if self.debug_mem and batch_count == 0:
                     _mem("after backward")
                 train_loss_total += train_loss.item()
                 
                 # Gradient accumulation
                 if ( (batch_count+1) % self.batch_number ==0) : # update after batch_number patients            
-                    self.optimizer.step()
+                    if self.amp:
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                    else:
+                        self.optimizer.step()
                     self.model.zero_grad()
                     # print('DEBUG: model updated', (batch_count+1), batch_number)
                     
                 elif ( (batch_count+1) == len(train_dataloader) ): # or if on last set of videos
-                    self.optimizer.step()
+                    if self.amp:
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                    else:
+                        self.optimizer.step()
                     self.model.zero_grad()
                     # print('DEBUG: model updated at end of epoch without reaching batch_num', (batch_count+1), len(train_dataloader))
 
                 if smoke_steps is not None and (batch_count + 1) >= smoke_steps:
                     if (batch_count + 1) % self.batch_number != 0:
-                        self.optimizer.step()
+                        if self.amp:
+                            self.scaler.step(self.optimizer)
+                            self.scaler.update()
+                        else:
+                            self.optimizer.step()
                         self.model.zero_grad()
                     break
                     
             epoch_end_time = time.time()
             
             # Get loss on validation dataset
-            __, __, __, val_loss_total = run_model_on_dataloader(self.model, val_dataloader, self.loss_fn)
+            __, __, __, val_loss_total = run_model_on_dataloader(
+                self.model,
+                val_dataloader,
+                self.loss_fn,
+                amp=self.amp,
+            )
             
             # update trained epoch count and log performance
             current_epoch = current_epoch + 1
@@ -685,7 +713,12 @@ class EchoFocus:
             return
         # Run on test dataset
         print(f'run model on {fold} set')
-        y_true, y_pred, EIDs, loss = run_model_on_dataloader(model, dataloader, self.loss_fn)
+        y_true, y_pred, EIDs, loss = run_model_on_dataloader(
+            model,
+            dataloader,
+            self.loss_fn,
+            amp=self.amp,
+        )
         # convert model outputs back
         y_true = np.array(y_true).squeeze()
         # y_true_test_norm = return_correct_output_np
@@ -807,7 +840,12 @@ class EchoFocus:
         
         # Run on test dataset
         print('run model on test set')
-        return_model_outputs, return_correct_outputs, return_EIDs, loss = run_model_on_dataloader(best_model, test_dataloader, self.loss_fn)
+        return_model_outputs, return_correct_outputs, return_EIDs, loss = run_model_on_dataloader(
+            best_model,
+            test_dataloader,
+            self.loss_fn,
+            amp=self.amp,
+        )
         # convert model outputs back
         return_correct_output_np = np.array(return_correct_outputs).squeeze()
         y_true_test_norm = return_correct_output_np
@@ -1118,7 +1156,7 @@ def load_model_and_random_state(path, model, optimizer=None, scheduler=None):
 
 #     return preds, labels, eids_all, mean_loss
 
-def run_model_on_dataloader(model, dataloader, loss_func_pointer):
+def run_model_on_dataloader(model, dataloader, loss_func_pointer, amp=False):
     """Run inference on a dataloader and collect outputs.
 
     Args:
@@ -1137,6 +1175,7 @@ def run_model_on_dataloader(model, dataloader, loss_func_pointer):
     return_EIDs = []
     loss = 0
     pbar = tqdm(dataloader, total=len(dataloader.dataset), desc="Inference")
+    use_amp = amp and torch.cuda.is_available()
     for embedding, correct_labels, eid in pbar:
         if torch.cuda.is_available():
             embedding = embedding.to("cuda")
@@ -1144,7 +1183,8 @@ def run_model_on_dataloader(model, dataloader, loss_func_pointer):
 
 
         with torch.no_grad():
-            model_outputs = model(embedding)
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                model_outputs = model(embedding)
             return_model_outputs.append(model_outputs.to('cpu'))
             return_correct_outputs.append(correct_labels.to('cpu'))
             return_EIDs.append(eid)

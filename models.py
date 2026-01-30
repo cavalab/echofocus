@@ -2,6 +2,7 @@
 
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from panecho import PanEchoBackbone
 
@@ -150,6 +151,7 @@ class EchoFocusEndToEnd(nn.Module):
         tf_combine="avg",
         panecho_trainable=True,
         debug_mem=False,
+        checkpoint_panecho=False,
     ):
         """Initialize the end-to-end model.
 
@@ -162,9 +164,11 @@ class EchoFocusEndToEnd(nn.Module):
             tf_combine (str): Pooling method.
             panecho_trainable (bool): Whether PanEcho backbone is trainable.
             debug_mem (bool): If True, print CUDA memory stats around PanEcho.
+            checkpoint_panecho (bool): If True, checkpoint PanEcho forward to save memory.
         """
         super().__init__()
         self.debug_mem = debug_mem
+        self.checkpoint_panecho = checkpoint_panecho
         self.panecho = PanEchoBackbone(backbone_only=True, trainable=panecho_trainable)
         self.transformer = CustomTransformer(
             input_size=input_size,
@@ -199,11 +203,14 @@ class EchoFocusEndToEnd(nn.Module):
 
         embeddings = []
         for idx, video_clips in enumerate(clips):
-            if idx == 0:
-                self._mem(f"idx={idx} panecho before")
-            video_emb = self.panecho(video_clips)
-            if idx == 0:
-                self._mem(f"idx={idx} panecho after")
+            if self.checkpoint_panecho:
+                try:
+                    video_emb = checkpoint(self.panecho, video_clips, use_reentrant=False)
+                except TypeError:
+                    video_emb = checkpoint(self.panecho, video_clips)
+            else:
+                video_emb = self.panecho(video_clips)
+            self._mem(f"idx={idx} panecho after")
             embeddings.append(video_emb)
         return torch.stack(embeddings, dim=0)
 
