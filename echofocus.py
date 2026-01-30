@@ -494,7 +494,7 @@ class EchoFocus:
 
         
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr = self.learning_rate, weight_decay = 0.01)
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.amp)
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.amp)
         # add the scheduler
         patience = 3
         lr_factor = 0.5
