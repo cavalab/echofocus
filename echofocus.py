@@ -208,7 +208,7 @@ class EchoFocus:
         print('_setup_data...')
         print('label path:',self.label_path)
         csv_data = pd.read_csv(self.label_path, nrows=self.sample_limit) # pull labels from local path
-        print('loaded ',self.label_path)
+        print('loaded',len(csv_data),'labels from',self.label_path)
         print('dropping duplicates...')
         csv_data = csv_data.drop_duplicates() # I don't know why there are duplicates, but there are...
         print('dropped duplicates')
