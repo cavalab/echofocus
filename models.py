@@ -179,6 +179,15 @@ class EchoFocusEndToEnd(nn.Module):
             tf_combine=tf_combine,
         )
 
+    def _mem(self,tag):
+        if not self.debug_mem or not torch.cuda.is_available():
+            return
+        torch.cuda.synchronize()
+        alloc = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        max_alloc = torch.cuda.max_memory_allocated() / 1024**3
+        print(f"[mem] {tag}: alloc={alloc:.2f}G reserved={reserved:.2f}G max={max_alloc:.2f}G")
+
     def _panecho_embed(self, clips):
         """Embed all clips with PanEcho.
 
@@ -191,19 +200,9 @@ class EchoFocusEndToEnd(nn.Module):
         if clips.ndim != 6:
             raise ValueError(f"Unexpected clips shape: {tuple(clips.shape)}")
 
-        def _mem(tag):
-            if not self.debug_mem or not torch.cuda.is_available():
-                return
-            torch.cuda.synchronize()
-            alloc = torch.cuda.memory_allocated() / 1024**3
-            reserved = torch.cuda.memory_reserved() / 1024**3
-            max_alloc = torch.cuda.max_memory_allocated() / 1024**3
-            print(f"[mem] {tag}: alloc={alloc:.2f}G reserved={reserved:.2f}G max={max_alloc:.2f}G")
 
         embeddings = []
         for idx, video_clips in enumerate(clips):
-            if idx == 0:
-                _mem("panecho before")
             if self.checkpoint_panecho:
                 try:
                     video_emb = checkpoint(self.panecho, video_clips, use_reentrant=False)
@@ -211,15 +210,17 @@ class EchoFocusEndToEnd(nn.Module):
                     video_emb = checkpoint(self.panecho, video_clips)
             else:
                 video_emb = self.panecho(video_clips)
-            if idx == 0:
-                _mem("panecho after")
+            self._mem(f"idx={idx} panecho after")
             embeddings.append(video_emb)
         return torch.stack(embeddings, dim=0)
 
     def forward(self, clips):
         """Compute outputs from raw clips."""
         embeddings = self._panecho_embed(clips)
-        return self.transformer(embeddings)
+        self._mem("transformer before")
+        embeddings= self.transformer(embeddings)
+        self._mem("transformer after")
+        return embeddings
 
     def embed(self, clips):
         """Return pooled representation from raw clips."""
