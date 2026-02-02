@@ -1,5 +1,6 @@
 """Dataset utilities for EchoFocus."""
 
+import json
 import torch
 import h5py
 import os
@@ -146,6 +147,53 @@ class EmbeddingDataset(torch.utils.data.Dataset):
         if self.cache_embeddings:
             self.video_cache[echo_id] = study_clips
         return study_clips, echo_id
+
+    def __len__(self):
+        """Return dataset size."""
+        return len(self.embedding_echo_id_list)
+
+class ShardedEmbeddingDataset(torch.utils.data.Dataset):
+    """Dataset that reads embeddings from sharded HDF5 cache files."""
+
+    def __init__(self, cache_dir, embedding_echo_id_list, cache_embeddings=True):
+        """Create a dataset for loading cached embeddings.
+
+        Args:
+            cache_dir (str): Cache directory containing ``cache_index.json``.
+            embedding_echo_id_list (list[int]): Echo IDs to include.
+            cache_embeddings (bool): Cache loaded embeddings in memory.
+        """
+        self.cache_dir = cache_dir
+        self.embedding_echo_id_list = embedding_echo_id_list
+        self.cache_embeddings = cache_embeddings
+        self.video_cache = {}
+        index_path = os.path.join(cache_dir, "cache_index.json")
+        with open(index_path, "r") as f:
+            self.cache_index = json.load(f)
+        self.num_shards = int(self.cache_index["num_shards"])
+        self.shard_format = self.cache_index["shard_format"]
+
+    def _shard_path(self, echo_id):
+        shard_id = int(echo_id) % self.num_shards
+        return os.path.join(self.cache_dir, self.shard_format.format(shard=shard_id))
+
+    def __getitem__(self, echo_id):
+        """Get cached embeddings for an echo study."""
+        if self.cache_embeddings and echo_id in self.video_cache:
+            return self.video_cache[echo_id], echo_id
+
+        shard_path = self._shard_path(echo_id)
+        with h5py.File(shard_path, "r") as f:
+            grp = f[str(int(echo_id))]
+            study_clips = grp["emb"][()]
+
+        if self.cache_embeddings:
+            self.video_cache[echo_id] = study_clips
+        return study_clips, echo_id
+
+    def get_filenames_by_echo_id(self, echo_id):
+        """Return empty filenames placeholder for cached embeddings."""
+        return np.array([]), echo_id
 
     def __len__(self):
         """Return dataset size."""
@@ -362,9 +410,15 @@ def get_dataset(
     # returns all embeddings, which are in a folder per study, as a dict
     study_embeddings = {}
     study_filenames = {}
-    emb_ds = EmbeddingDataset(
-        embed_path, embedding_echo_id_list, cache_embeddings=cache_embeddings
-    )
+    cache_index_path = os.path.join(embed_path, "cache_index.json")
+    if os.path.isfile(cache_index_path):
+        emb_ds = ShardedEmbeddingDataset(
+            embed_path, embedding_echo_id_list, cache_embeddings=cache_embeddings
+        )
+    else:
+        emb_ds = EmbeddingDataset(
+            embed_path, embedding_echo_id_list, cache_embeddings=cache_embeddings
+        )
     # todo: pass n workers to embeddingdataset
     if not preload:
         return emb_ds

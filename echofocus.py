@@ -15,6 +15,7 @@ import h5py
 import torch
 import time
 from datetime import datetime
+import sys
 
 # import cv2
 import numpy as np
@@ -138,6 +139,15 @@ class EchoFocus:
 
         print("learning_rate", learning_rate, "\n")
 
+        self._cli_overrides = set()
+        for arg in sys.argv[1:]:
+            if not arg.startswith("--"):
+                continue
+            key = arg[2:]
+            if "=" in key:
+                key = key.split("=", 1)[0]
+            self._cli_overrides.add(key)
+
 
         # 1. Check cuda
         for i in range(torch.cuda.device_count()):
@@ -166,6 +176,15 @@ class EchoFocus:
         self._load_config()
         self._set_loss()
 
+    def _embedding_eids_from_path(self):
+        """Return echo IDs available under the embedding path."""
+        cache_index_path = os.path.join(self.embedding_path, "cache_index.json")
+        if os.path.isfile(cache_index_path):
+            with open(cache_index_path, "r") as f:
+                cache_index = json.load(f)
+            return [int(eid) for eid in cache_index.get("eids", [])]
+        return [int(k.split("_")[0]) for k in os.listdir(self.embedding_path)]
+
     def _load_config(self):
         """Load dataset/task config and set instance attributes.
 
@@ -181,10 +200,14 @@ class EchoFocus:
         if self.dataset not in data['dataset'].keys():
             raise ValueError(f'dataset must be one of: {list(data["dataset"].keys())}; got \"{self.dataset}\"')
         for k,v in data['task'][self.task].items():
+            if k in self._cli_overrides:
+                continue
             if hasattr(self, k) and getattr(self, k) != v:
                 print(f'WARNING: overriding init arg {k}={getattr(self, k)} with config value {v}')
             setattr(self,k,v)
         for k,v in data['dataset'][self.dataset].items():
+            if k in self._cli_overrides:
+                continue
             if hasattr(self, k) and getattr(self, k) != v:
                 print(f'WARNING: overriding init arg {k}={getattr(self, k)} with config value {v}')
             setattr(self,k,v)
@@ -233,9 +256,7 @@ class EchoFocus:
             ]
         else:
             print('embed path:',self.embedding_path)
-            Embedding_EchoID_List = [
-                int(k.split("_")[0]) for k in os.listdir(self.embedding_path)
-            ]
+            Embedding_EchoID_List = self._embedding_eids_from_path()
 
         print('Num echos in embedding folder:',len(Embedding_EchoID_List))
         # 3.2 limit label df rows to those
@@ -423,6 +444,172 @@ class EchoFocus:
         
 
         return train_dataloader, valid_dataloader, test_dataloader, input_norm_dict
+
+    def cache_embeddings(
+        self,
+        cache_root="embed/cache",
+        cache_tag=None,
+        num_shards=512,
+        compression="lzf",
+        dtype="float16",
+        use_train_transforms=False,
+        overwrite=False,
+        max_eids=None,
+        amp=False,
+        seed=None,
+    ):
+        """Cache PanEcho embeddings into sharded HDF5 files.
+
+        Args:
+            cache_root (str): Root directory for cached embeddings.
+            cache_tag (str|None): Optional cache directory name override.
+            num_shards (int): Number of HDF5 shard files to write.
+            compression (str|None): HDF5 compression ("lzf", "gzip", or None).
+            dtype (str): Numpy dtype for stored embeddings ("float16" or "float32").
+            use_train_transforms (bool): If True, use Train_Transforms.
+            overwrite (bool): If True, overwrite existing cached embeddings.
+            max_eids (int|None): Limit number of echo IDs to cache.
+            amp (bool): If True, use autocast for embedding generation.
+            seed (int|None): Optional RNG seed for deterministic clip sampling.
+        """
+        print("cache_embeddings: starting")
+        if seed is not None:
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+
+        print('label path:',self.label_path)
+        csv_data = pd.read_csv(self.label_path, nrows=self.sample_limit)
+        print('loaded',len(csv_data),'labels from',self.label_path)
+        print('dropping duplicates...')
+        csv_data = csv_data.drop_duplicates()
+        print('dropped duplicates')
+
+        if not self.use_hdf5_index:
+            print('video_base_path:',self.video_base_path)
+            candidate_eids = csv_data["eid"].astype(int).unique()
+            available_eids = [
+                eid
+                for eid in candidate_eids
+                if os.path.isdir(
+                    os.path.join(
+                        self.video_base_path,
+                        self.video_subdir_format.format(echo_id=int(eid)),
+                    )
+                )
+            ]
+        else:
+            print('embed path:',self.embedding_path)
+            available_eids = self._embedding_eids_from_path()
+
+        print('Num echos available:',len(available_eids))
+        tmp = csv_data.copy()
+        mask = tmp['eid'].isin(available_eids)
+        tmp = tmp[mask]
+        print('N echos after in_csv filter:',len(tmp))
+        tmp = tmp.loc[tmp[self.task_labels].dropna(how='all').index]
+        print('N Echos after excluding missing labels:',len(tmp))
+        eid_keep_list = tmp['eid'].astype(int).values
+        if max_eids is not None:
+            eid_keep_list = eid_keep_list[:max_eids]
+
+        from panecho import PanEchoBackbone
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        panecho = PanEchoBackbone(backbone_only=True, trainable=False).to(device)
+        panecho.eval()
+
+        def _hash_state_dict(state_dict):
+            import hashlib
+            h = hashlib.sha1()
+            for k in sorted(state_dict.keys()):
+                h.update(k.encode("utf-8"))
+                t = state_dict[k].detach().cpu().contiguous()
+                h.update(str(tuple(t.shape)).encode("utf-8"))
+                h.update(t.numpy().tobytes())
+            return h.hexdigest()
+
+        panecho_hash = _hash_state_dict(panecho.model.state_dict())
+        transform_name = "Train_Transforms" if use_train_transforms else "Test_Transforms"
+        cache_meta = {
+            "version": 1,
+            "panecho_hash": panecho_hash,
+            "num_clips": int(self.num_clips),
+            "clip_len": int(self.clip_len),
+            "transform": transform_name,
+            "num_shards": int(num_shards),
+            "shard_format": "shard_{shard:05d}.h5",
+            "dtype": dtype,
+            "compression": compression,
+            "video_subdir_format": self.video_subdir_format,
+            "use_hdf5_index": bool(self.use_hdf5_index),
+            "created_at": str(datetime.now()),
+            "eids": [int(eid) for eid in eid_keep_list],
+        }
+
+        import hashlib
+        cache_key_payload = json.dumps(
+            {
+                "panecho_hash": panecho_hash,
+                "num_clips": int(self.num_clips),
+                "clip_len": int(self.clip_len),
+                "transform": transform_name,
+                "version": 1,
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+        cache_key = hashlib.sha1(cache_key_payload).hexdigest()[:12]
+
+        cache_dir_name = cache_tag if cache_tag else cache_key
+        cache_dir = os.path.join(cache_root, cache_dir_name)
+        os.makedirs(cache_dir, exist_ok=True)
+        print(f"cache_dir: {cache_dir}")
+        cache_index_path = os.path.join(cache_dir, "cache_index.json")
+        if not os.path.isfile(cache_index_path) or overwrite:
+            with open(cache_index_path, "w") as f:
+                json.dump(cache_meta, f, indent=2)
+        else:
+            print("cache_index.json already exists; reusing it.")
+
+        transforms = Train_Transforms if use_train_transforms else Test_Transforms
+        video_ds = get_video_dataset(
+            self.embedding_path,
+            eid_keep_list,
+            transforms=transforms,
+            cache_clips=False,
+            num_clips=self.num_clips,
+            clip_len=self.clip_len,
+            base_path=self.video_base_path,
+            use_hdf5_index=self.use_hdf5_index,
+            video_subdir_format=self.video_subdir_format,
+        )
+
+        dtype_np = np.float16 if dtype == "float16" else np.float32
+        use_amp = amp and torch.cuda.is_available()
+        shard_map = {}
+        for eid in eid_keep_list:
+            shard_id = int(eid) % int(num_shards)
+            shard_map.setdefault(shard_id, []).append(int(eid))
+
+        for shard_id in sorted(shard_map.keys()):
+            shard_path = os.path.join(cache_dir, f"shard_{shard_id:05d}.h5")
+            with h5py.File(shard_path, "a") as f:
+                for eid in tqdm(shard_map[shard_id], desc=f"Shard {shard_id:05d}"):
+                    if str(eid) in f and not overwrite:
+                        if "emb" in f[str(eid)]:
+                            continue
+                    clips, _ = video_ds[eid]
+                    clips = clips.to(device)
+                    embeddings = []
+                    with torch.no_grad():
+                        for video_clips in clips:
+                            with torch.amp.autocast("cuda", enabled=use_amp):
+                                video_emb = panecho(video_clips)
+                            embeddings.append(video_emb.detach().cpu())
+                    emb = torch.stack(embeddings, dim=0).numpy().astype(dtype_np)
+                    grp = f.require_group(str(eid))
+                    if "emb" in grp:
+                        del grp["emb"]
+                    grp.create_dataset("emb", data=emb, compression=compression)
+        print("cache_embeddings: done")
 
     # def _normalize_data(self):
 
@@ -698,6 +885,53 @@ class EchoFocus:
         best_model,_,_,_,input_norm_dict  = load_model_and_random_state(best_checkpoint_path, model)
         for dataloader,fold in zip((train_dataloader,val_dataloader,test_dataloader),('train','val','test')):
             self._evaluate(best_model, dataloader, fold, input_norm_dict)
+
+    def train_freeze_unfreeze(
+        self,
+        freeze_epochs=1,
+        unfreeze_epochs=1,
+        freeze_lr=None,
+        unfreeze_lr=None,
+        split=(64,16,20),
+    ):
+        """Train with a freeze/unfreeze schedule for the PanEcho backbone.
+
+        Args:
+            freeze_epochs (int): Number of epochs to train with frozen PanEcho.
+            unfreeze_epochs (int): Number of epochs to train with PanEcho unfrozen.
+            freeze_lr (float|None): Optional learning rate override for frozen phase.
+            unfreeze_lr (float|None): Optional learning rate override for unfrozen phase.
+            split (tuple[int,int,int]): Train/val/test split.
+        """
+        last_ckpt = os.path.join(self.model_path, "last_checkpoint.pt")
+        current_epoch = 0
+        if os.path.isfile(last_ckpt):
+            try:
+                ckpt = torch.load(last_ckpt, map_location="cpu")
+                if "perf_log" in ckpt and len(ckpt["perf_log"]) > 0:
+                    current_epoch = ckpt["perf_log"][-1][0]
+            except Exception:
+                print("warning: failed to read last checkpoint for epoch count")
+
+        phase1_limit = current_epoch + int(freeze_epochs)
+        phase2_limit = phase1_limit + int(unfreeze_epochs)
+        orig_lr = self.learning_rate
+
+        print(f"freeze phase: epochs {current_epoch} -> {phase1_limit}")
+        self.panecho_trainable = False
+        if freeze_lr is not None:
+            self.learning_rate = freeze_lr
+        self.epoch_lim = phase1_limit
+        self.train(split=split)
+
+        print(f"unfreeze phase: epochs {phase1_limit} -> {phase2_limit}")
+        self.panecho_trainable = True
+        if unfreeze_lr is not None:
+            self.learning_rate = unfreeze_lr
+        else:
+            self.learning_rate = orig_lr
+        self.epoch_lim = phase2_limit
+        self.train(split=split)
 
     def _evaluate(self, model, dataloader, fold, input_norm_dict=None):
         """Evaluate a model on a dataloader and write outputs.
