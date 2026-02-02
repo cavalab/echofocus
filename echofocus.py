@@ -63,6 +63,7 @@ class EchoFocus:
         cache_embeddings=False,
         end_to_end=True,
         panecho_trainable=True,
+        transformer_trainable=True,
         num_clips=16,
         clip_len=16,
         use_hdf5_index=False,
@@ -101,6 +102,7 @@ class EchoFocus:
             cache_embeddings (bool): Cache embeddings in memory.
             end_to_end (bool): If True, train end-to-end with PanEcho backbone.
             panecho_trainable (bool): If True, fine-tune the PanEcho backbone.
+            transformer_trainable (bool): If True, train the study-level transformer.
             num_clips (int): Number of clips sampled per video.
             clip_len (int): Frames per clip.
             use_hdf5_index (bool): Use embedding HDF5s to locate video paths.
@@ -184,6 +186,30 @@ class EchoFocus:
                 cache_index = json.load(f)
             return [int(eid) for eid in cache_index.get("eids", [])]
         return [int(k.split("_")[0]) for k in os.listdir(self.embedding_path)]
+
+    def _set_trainable_flags(self):
+        """Apply trainable flags to model submodules."""
+        if not hasattr(self, "model") or self.model is None:
+            return
+        if hasattr(self.model, "panecho"):
+            for param in self.model.panecho.parameters():
+                param.requires_grad = bool(self.panecho_trainable)
+        if hasattr(self.model, "transformer"):
+            for param in self.model.transformer.parameters():
+                param.requires_grad = bool(self.transformer_trainable)
+
+    def _get_last_epoch(self):
+        """Return last trained epoch from checkpoint, or 0 if missing."""
+        last_ckpt = os.path.join(self.model_path, "last_checkpoint.pt")
+        if not os.path.isfile(last_ckpt):
+            return 0
+        try:
+            ckpt = torch.load(last_ckpt, map_location="cpu")
+            if "perf_log" in ckpt and len(ckpt["perf_log"]) > 0:
+                return ckpt["perf_log"][-1][0]
+        except Exception:
+            pass
+        return 0
 
     def _load_config(self):
         """Load dataset/task config and set instance attributes.
@@ -666,6 +692,7 @@ class EchoFocus:
                 clip_dropout=self.clip_dropout,
                 tf_combine="avg",
             )
+        self._set_trainable_flags()
         total_params = sum(p.numel() for p in self.model.parameters())
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         print(
@@ -741,8 +768,32 @@ class EchoFocus:
             use_train_transforms=True,
         )
         
-        # 9. Train
-        # Training loop
+        self._run_training_loop(
+            model,
+            current_epoch,
+            best_epoch,
+            best_loss,
+            input_norm_dict,
+            train_dataloader,
+            val_dataloader,
+            test_dataloader,
+            smoke_steps=smoke_steps,
+        )
+
+    def _run_training_loop(
+        self,
+        model,
+        current_epoch,
+        best_epoch,
+        best_loss,
+        input_norm_dict,
+        train_dataloader,
+        val_dataloader,
+        test_dataloader,
+        smoke_steps=None,
+        epoch_hook=None,
+    ):
+        """Run the main training loop with an optional per-epoch hook."""
         print('begin training loop')
         def _mem(tag):
             if not torch.cuda.is_available():
@@ -756,9 +807,14 @@ class EchoFocus:
         while (current_epoch < self.epoch_lim) and (
             current_epoch - best_epoch < self.epoch_early_stop
         ):
+            if epoch_hook is not None:
+                epoch_hook(current_epoch)
+                self._set_trainable_flags()
+                for pg in self.optimizer.param_groups:
+                    pg['lr'] = self.learning_rate
+
             self.model.train()
             epoch_start_time = time.time()
-            # Train an epoch
             train_loss_total = 0
 
             for batch_count, (Embedding, Correct_Out, EID) in tqdm(
@@ -766,9 +822,6 @@ class EchoFocus:
                 desc=f"Epoch {current_epoch}",
                 total=len(train_dataloader),
             ):
-                #TODO: for quasi-batch for parallel workers in train data loader,
-                # add an extra loop to loop over batches                 
-
                 if (torch.cuda.is_available()):
                     Embedding = Embedding.to('cuda')
                     Correct_Out = Correct_Out.to('cuda')
@@ -782,7 +835,6 @@ class EchoFocus:
                     _mem("after forward")
                 if self.debug_mem and batch_count == 0:
                     _mem("after loss")
-                # train_loss = Loss_Func(out, Correct_lvef)
                 if self.amp:
                     self.scaler.scale(train_loss).backward()
                 else:
@@ -791,24 +843,20 @@ class EchoFocus:
                     _mem("after backward")
                 train_loss_total += train_loss.item()
                 
-                # Gradient accumulation
-                if ( (batch_count+1) % self.batch_number ==0) : # update after batch_number patients            
+                if ( (batch_count+1) % self.batch_number ==0) :           
                     if self.amp:
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
                     else:
                         self.optimizer.step()
                     self.model.zero_grad()
-                    # print('DEBUG: model updated', (batch_count+1), batch_number)
-                    
-                elif ( (batch_count+1) == len(train_dataloader) ): # or if on last set of videos
+                elif ( (batch_count+1) == len(train_dataloader) ):
                     if self.amp:
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
                     else:
                         self.optimizer.step()
                     self.model.zero_grad()
-                    # print('DEBUG: model updated at end of epoch without reaching batch_num', (batch_count+1), len(train_dataloader))
 
                 if smoke_steps is not None and (batch_count + 1) >= smoke_steps:
                     if (batch_count + 1) % self.batch_number != 0:
@@ -822,7 +870,6 @@ class EchoFocus:
                     
             epoch_end_time = time.time()
             
-            # Get loss on validation dataset
             __, __, __, val_loss_total = run_model_on_dataloader(
                 self.model,
                 val_dataloader,
@@ -830,7 +877,6 @@ class EchoFocus:
                 amp=self.amp,
             )
             
-            # update trained epoch count and log performance
             current_epoch = current_epoch + 1
             
             tmp_LR = self.optimizer.state_dict()['param_groups'][0]['lr']
@@ -842,12 +888,9 @@ class EchoFocus:
                     'epoch time':epoch_end_time - epoch_start_time,
             }
             self.perf_log.append(list(perf.values()))
-            # print(self.perf_log[-1])
             print(' '.join([f'{k}: {v}' for k,v in perf.items() if k in ['train loss','val loss','lr']]))
             self.save_log()
             
-
-            # update scheduler
             self.scheduler.step(val_loss_total)
             save_nn(
                 self.model,
@@ -858,7 +901,6 @@ class EchoFocus:
                 input_norm_dict=input_norm_dict,
             )
                 
-            # if validation loss better than previous checkpoint, save as best
             if (val_loss_total < best_loss):
                 save_nn(
                     self.model,
@@ -871,13 +913,11 @@ class EchoFocus:
                 best_loss = val_loss_total 
                 best_epoch = current_epoch
 
-            
             if (current_epoch == self.epoch_lim): 
                 print('current epoch = epoch limit, terminating')
             if current_epoch - best_epoch == self.epoch_early_stop:
                 print('early stopping')
             
-        # Save training progress figure
         utils.plot_training_progress( self.model_path, self.perf_log)
         print('Training Completed')
         
@@ -886,53 +926,81 @@ class EchoFocus:
         for dataloader,fold in zip((train_dataloader,val_dataloader,test_dataloader),('train','val','test')):
             self._evaluate(best_model, dataloader, fold, input_norm_dict)
 
-    def train_freeze_unfreeze(
+    def train_ping_pong(
         self,
-        freeze_epochs=1,
-        unfreeze_epochs=1,
-        freeze_lr=None,
-        unfreeze_lr=None,
+        total_epochs=10,
+        start_with="transformer",
+        switch_every=1,
+        transformer_lr=None,
+        panecho_lr=None,
         split=(64,16,20),
     ):
-        """Train with a freeze/unfreeze schedule for the PanEcho backbone.
+        """Alternate training between transformer-only and PanEcho-only phases.
 
         Args:
-            freeze_epochs (int): Number of epochs to train with frozen PanEcho.
-            unfreeze_epochs (int): Number of epochs to train with PanEcho unfrozen.
-            freeze_lr (float|None): Optional learning rate override for frozen phase.
-            unfreeze_lr (float|None): Optional learning rate override for unfrozen phase.
+            total_epochs (int): Total epochs to train to.
+            start_with (str): "transformer" or "panecho".
+            switch_every (int): Number of epochs per phase.
+            transformer_lr (float|None): Optional LR for transformer-only phases.
+            panecho_lr (float|None): Optional LR for panecho-only phases.
             split (tuple[int,int,int]): Train/val/test split.
         """
-        last_ckpt = os.path.join(self.model_path, "last_checkpoint.pt")
-        current_epoch = 0
-        if os.path.isfile(last_ckpt):
-            try:
-                ckpt = torch.load(last_ckpt, map_location="cpu")
-                if "perf_log" in ckpt and len(ckpt["perf_log"]) > 0:
-                    current_epoch = ckpt["perf_log"][-1][0]
-            except Exception:
-                print("warning: failed to read last checkpoint for epoch count")
+        if start_with not in ("transformer", "panecho"):
+            raise ValueError("start_with must be 'transformer' or 'panecho'")
+        smoke_steps = None
+        if self.smoke_train:
+            if total_epochs < 1:
+                total_epochs = 1
+            self.epoch_early_stop = 1
+            self.sample_limit = min(self.sample_limit, self.smoke_num_samples)
+            smoke_steps = self.smoke_num_steps
+            print(
+                "smoke_train enabled:",
+                f"samples={self.sample_limit}, steps={smoke_steps}, epochs={total_epochs}",
+            )
 
-        phase1_limit = current_epoch + int(freeze_epochs)
-        phase2_limit = phase1_limit + int(unfreeze_epochs)
+        self.epoch_lim = int(total_epochs)
+        model, current_epoch, best_epoch, best_loss, input_norm_dict = self._setup_model()
+        train_dataloader, val_dataloader, test_dataloader, input_norm_dict = self._setup_data(
+            input_norm_dict,
+            use_train_transforms=True,
+        )
+
         orig_lr = self.learning_rate
+        switch_every = max(1, int(switch_every))
+        start_phase_idx = 0 if start_with == "transformer" else 1
 
-        print(f"freeze phase: epochs {current_epoch} -> {phase1_limit}")
-        self.panecho_trainable = False
-        if freeze_lr is not None:
-            self.learning_rate = freeze_lr
-        self.epoch_lim = phase1_limit
-        self.train(split=split)
+        def _epoch_hook(epoch):
+            phase_idx = ((epoch // switch_every) + start_phase_idx) % 2
+            if phase_idx == 0:
+                print(f"phase: transformer-only epoch {epoch}")
+                self.panecho_trainable = False
+                self.transformer_trainable = True
+                if transformer_lr is not None:
+                    self.learning_rate = transformer_lr
+                else:
+                    self.learning_rate = orig_lr
+            else:
+                print(f"phase: panecho-only epoch {epoch}")
+                self.panecho_trainable = True
+                self.transformer_trainable = False
+                if panecho_lr is not None:
+                    self.learning_rate = panecho_lr
+                else:
+                    self.learning_rate = orig_lr
 
-        print(f"unfreeze phase: epochs {phase1_limit} -> {phase2_limit}")
-        self.panecho_trainable = True
-        if unfreeze_lr is not None:
-            self.learning_rate = unfreeze_lr
-        else:
-            self.learning_rate = orig_lr
-        self.epoch_lim = phase2_limit
-        self.train(split=split)
-
+        self._run_training_loop(
+            model,
+            current_epoch,
+            best_epoch,
+            best_loss,
+            input_norm_dict,
+            train_dataloader,
+            val_dataloader,
+            test_dataloader,
+            smoke_steps=smoke_steps,
+            epoch_hook=_epoch_hook,
+        )
     def _evaluate(self, model, dataloader, fold, input_norm_dict=None):
         """Evaluate a model on a dataloader and write outputs.
 
