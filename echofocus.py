@@ -72,7 +72,7 @@ class EchoFocus:
         video_base_path="/lab-share/Cardio-Mayourian-e2/Public/Echo_Pulled",
         video_subdir_format="{echo_id}_trim",
         smoke_train=False,
-        smoke_num_samples=8,
+        smoke_num_samples=10_000,
         smoke_num_steps=2,
         debug_mem=False,
         amp=False,
@@ -98,7 +98,6 @@ class EchoFocus:
             test_only (bool): If True, run evaluation only.
             parallel_processes (int): Number of dataloader workers.
             sample_limit (int): Limit number of samples.
-            preload_embeddings (bool): Deprecated preload mode.
             run_id (str|None): Optional run ID for reproducibility.
             config (str): Path to config JSON file.
             cache_embeddings (bool): Cache embeddings in memory.
@@ -265,14 +264,17 @@ class EchoFocus:
         """
         print('_setup_data...')
         print('label path:',self.label_path)
-        csv_data = pd.read_csv(self.label_path, nrows=self.sample_limit) # pull labels from local path
+        csv_data = pd.read_csv(self.label_path) # pull labels from local path
         print('loaded',len(csv_data),'labels from',self.label_path)
         print('dropping duplicates...')
         csv_data = csv_data.drop_duplicates() # I don't know why there are duplicates, but there are...
-        print('dropped duplicates')
+        print('dropped duplicates, new length:',len(csv_data))
+        # if self.sample_limit < len(csv_data):
+        #     print('sampling csv_data')
         if self.end_to_end and not self.use_hdf5_index:
             print('video_base_path:',self.video_base_path)
             candidate_eids = csv_data["eid"].astype(int).unique()
+            print('candidate_eids:',candidate_eids)
             Embedding_EchoID_List = [
                 eid
                 for eid in candidate_eids
@@ -310,7 +312,6 @@ class EchoFocus:
                 eid_keep_list,
                 limit=self.sample_limit,
                 parallel_processes=self.parallel_processes,
-                # preload=self.preload_embeddings,
                 cache_embeddings=self.cache_embeddings,
                 batch_size=self.batch_size
             )
@@ -371,11 +372,9 @@ class EchoFocus:
         print('Train_DF n=',len(Train_DF),', pids:',Train_DF.pid.nunique())
         print('Valid_DF n=',len(Valid_DF),', pids:',Valid_DF.pid.nunique())
         print('Test_DF n=',len(Test_DF),', pids:',Test_DF.pid.nunique())
-        # import ipdb                
-        # ipdb.set_trace()
-        # self._setup_model()
 
-        # 7. Get normalization parameters, normalize datasets
+
+        # Get normalization parameters, normalize datasets
         # if (('input_norm_dict' not in locals()) or (input_norm_dict is None)): # if didn't get or never had
         if self.task=='measure':
             if input_norm_dict is None:
@@ -1382,85 +1381,6 @@ def load_model_and_random_state(path, model, optimizer=None, scheduler=None):
     
     return model, optimizer, scheduler, perf_log, input_norm_dict
 
-# # WGL: draft of a batch version of this function
-# def run_model_on_dataloader(
-#     model: torch.nn.Module,
-#     dataloader: torch.utils.data.DataLoader,
-#     loss_func: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
-#     *,
-#     device: Optional[Union[str, torch.device]] = None,
-# ) -> Tuple[torch.Tensor, torch.Tensor, List[int], float]:
-#     """
-#     Assumes Dataset.__getitem__ returns:
-#         embedding, label, eid   (eid is an int)
-
-#     Returns:
-#         preds: (N, ...) CPU tensor
-#         labels: (N, ...) CPU tensor
-#         eids: List[int] length N
-#         mean_loss: float (per-sample)
-#     """
-#     model.eval()
-
-#     if device is None:
-#         try:
-#             device = next(model.parameters()).device
-#         except StopIteration:
-#             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-#     else:
-#         device = torch.device(device)
-
-#     preds: List[torch.Tensor] = []
-#     labels: List[torch.Tensor] = []
-#     eids_all: List[int] = []
-
-#     total_loss = 0.0
-#     total_n = 0
-
-#     pbar = tqdm(dataloader, total=len(dataloader.dataset), unit="samples")
-
-#     with torch.inference_mode():
-#         for embedding, label, eid in pbar:
-#             # embedding: (B, ...)
-#             # label:     (B, ...)
-#             # eid:       tensor shape (B,) or scalar
-#             # print('embedding shape:',embedding.shape)
-#             embedding = embedding.to(device, non_blocking=True)
-#             label = label.to(device, non_blocking=True)
-
-#             outputs = model(embedding)
-
-#             loss_t = loss_func(outputs, label)
-#             B = embedding.shape[0]
-#             total_n += B
-
-#             # Correct averaging regardless of loss reduction
-#             if loss_t.ndim == 0:
-#                 total_loss += float(loss_t) * B
-#                 loss_display = float(loss_t)
-#             else:
-#                 total_loss += float(loss_t.sum())
-#                 loss_display = float(loss_t.mean())
-
-#             preds.append(outputs.cpu())
-#             labels.append(label.cpu())
-
-#             # ---- EID handling ----
-#             if torch.is_tensor(eid):
-#                 eids_all.extend(int(v) for v in eid.cpu().tolist())
-#             else:
-#                 # batch_size == 1 fallback
-#                 eids_all.append(int(eid))
-
-#             # pbar.set_postfix(loss=loss_display)
-#             # pbar.update(B)
-#     # pbar.close()
-
-#     preds = torch.cat(preds, dim=0)
-#     labels = torch.cat(labels, dim=0)
-#     mean_loss = total_loss / total_n
-
-#     return preds, labels, eids_all, mean_loss
 
 def run_model_on_dataloader(model, dataloader, loss_func_pointer, amp=False):
     """Run inference on a dataloader and collect outputs.
