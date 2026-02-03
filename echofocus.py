@@ -421,6 +421,8 @@ class EchoFocus:
             shuffle=False,
             collate_fn=custom_collate,
             num_workers=self.parallel_processes,
+            pin_memory=True,
+            persistent_workers=bool(self.parallel_processes),
         )
 
         if (Tr == 0):
@@ -455,6 +457,8 @@ class EchoFocus:
                 #     weights, len(weights), replacement=True
                 # ),
                 num_workers=self.parallel_processes,
+                pin_memory=True,
+                persistent_workers=bool(self.parallel_processes),
             )
             
             if self.end_to_end:
@@ -482,6 +486,8 @@ class EchoFocus:
                 shuffle=False,
                 collate_fn=custom_collate,
                 num_workers=self.parallel_processes,
+                pin_memory=True,
+                persistent_workers=bool(self.parallel_processes),
             )
         
 
