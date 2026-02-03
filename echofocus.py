@@ -208,14 +208,18 @@ class EchoFocus:
                     out = subprocess.check_output(
                         [
                             "nvidia-smi",
-                            "--query-gpu=timestamp,utilization.gpu,utilization.memory,memory.used,memory.total",
+                            "--query-gpu=utilization.gpu,utilization.memory",
                             "--format=csv,noheader,nounits",
                         ],
                         stderr=subprocess.DEVNULL,
                         text=True,
                     ).strip()
                     if out:
-                        print(f"[gpu] {out}")
+                        parts = [p.strip() for p in out.split(",")]
+                        if len(parts) >= 2:
+                            self._gpu_status = f"{parts[0]}%/{parts[1]}%"
+                        else:
+                            self._gpu_status = out
                 except Exception:
                     pass
                 stop_event.wait(self.gpu_monitor_interval)
@@ -853,6 +857,7 @@ class EchoFocus:
         monitor_thread = None
         monitor_stop = None
         if self.gpu_monitor:
+            self._gpu_status = ""
             monitor_thread, monitor_stop = self._start_gpu_monitor()
         prof = None
         prof_records = []
@@ -896,11 +901,14 @@ class EchoFocus:
             epoch_start_time = time.time()
             train_loss_total = 0
 
-            for batch_count, (Embedding, Correct_Out, EID) in tqdm(
-                enumerate(train_dataloader),
+            pbar = tqdm(
+                train_dataloader,
                 desc=f"Epoch {current_epoch}",
                 total=len(train_dataloader),
-            ):
+            )
+            for batch_count, (Embedding, Correct_Out, EID) in enumerate(pbar):
+                if self.gpu_monitor and self._gpu_status:
+                    pbar.set_postfix_str(f"gpu={self._gpu_status}")
                 batch_start = time.time()
                 data_wait = None
                 if prev_batch_end is not None:
