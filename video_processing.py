@@ -6,6 +6,19 @@ import torch
 from torchvision import tv_tensors
 from torchvision.transforms import v2
 
+try:
+    cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
+except Exception:
+    pass
+
+_WARNED_FILES = set()
+
+
+def _warn_once(msg):
+    if msg in _WARNED_FILES:
+        return
+    _WARNED_FILES.add(msg)
+    print(msg)
 
 # https://discuss.pytorch.org/t/speed-up-dataloader-using-the-new-torchvision-transforms-support-for-tensor-batch-computation-gpu/113166
 Train_Transforms = torch.nn.Sequential(
@@ -60,6 +73,14 @@ def pull_clip(file_loc, transform_func, clip_len=16):
         torch.Tensor: Clip tensor shaped (1, 3, clip_len, 224, 224).
     """
     capture = cv2.VideoCapture(file_loc)
+    if not capture.isOpened():
+        _warn_once(f"warning: failed to open video {file_loc}")
+        frames = np.zeros((clip_len, 256, 256, 3), dtype=np.uint8)
+        frames = tv_tensors.Video(np.transpose(frames, (0, 3, 1, 2)))
+        frames = frames.type(torch.float32) / 255
+        frames = transform_func(frames)
+        clip = frames.unsqueeze(0).transpose(1, 2)
+        return clip
     frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
 
     if frame_count < clip_len:
@@ -75,7 +96,7 @@ def pull_clip(file_loc, transform_func, clip_len=16):
         if i < frame_count:
             ret, frame = capture.read()
             if not ret or frame is None:
-                print(f"warning: failed to read frame from {file_loc}")
+                _warn_once(f"warning: failed to read frame from {file_loc}")
                 if last_frame is None:
                     # Fallback to a black frame if the first read fails
                     frame = np.zeros((256, 256, 3), dtype=np.uint8)

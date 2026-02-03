@@ -241,6 +241,21 @@ class VideoClipDataset(torch.utils.data.Dataset):
         self.store_keychain = True
         self.video_cache = {}
 
+    def _filter_video_files(self, files):
+        exts = {
+            ".avi",
+            ".mp4",
+            ".mov",
+            ".mkv",
+            ".mpg",
+            ".mpeg",
+            ".wmv",
+            ".m4v",
+            ".webm",
+        }
+        filtered = [f for f in files if os.path.splitext(f)[1].lower() in exts]
+        return filtered if len(filtered) > 0 else files
+
     def _get_subframe(self, f, echo_id):
         """Get the HDF5 group and base path for an echo ID."""
         base_path = self.base_path
@@ -275,6 +290,7 @@ class VideoClipDataset(torch.utils.data.Dataset):
                 for file in videos:
                     study_filename = "/".join([base_path, file])
                     study_filenames.append(study_filename)
+            study_filenames = self._filter_video_files(study_filenames)
             return np.array(study_filenames), echo_id
 
         study_dir = os.path.join(
@@ -286,7 +302,8 @@ class VideoClipDataset(torch.utils.data.Dataset):
             for f in os.listdir(study_dir)
             if os.path.isfile(os.path.join(study_dir, f))
         ]
-        return np.array(sorted(files)), echo_id
+        files = self._filter_video_files(sorted(files))
+        return np.array(files), echo_id
 
     def __getitem__(self, echo_id):
         """Get all clip tensors for an echo study."""
