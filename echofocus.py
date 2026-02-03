@@ -72,7 +72,6 @@ class EchoFocus:
         video_base_path="/lab-share/Cardio-Mayourian-e2/Public/Echo_Pulled",
         video_subdir_format="{echo_id}_trim",
         smoke_train=False,
-        smoke_num_samples=10_000,
         smoke_num_steps=2,
         debug_mem=False,
         amp=False,
@@ -110,7 +109,6 @@ class EchoFocus:
             video_base_path (str): Base path for raw study folders.
             video_subdir_format (str): Format for study folder under base path.
             smoke_train (bool): If True, run a minimal smoke-training pass.
-            smoke_num_samples (int): Number of samples for smoke training.
             smoke_num_steps (int): Number of batches per epoch for smoke training.
             debug_mem (bool): If True, print CUDA memory stats for first batch each epoch.
             amp (bool): If True, use autocast + GradScaler mixed precision.
@@ -758,7 +756,7 @@ class EchoFocus:
             else:
                 self.total_epochs = min(self.total_epochs, 1)
             self.epoch_early_stop = 1
-            self.sample_limit = min(self.sample_limit, self.smoke_num_samples)
+            self.sample_limit = min(self.sample_limit, 5000)
             smoke_steps = self.smoke_num_steps
             print(
                 "smoke_train enabled:",
@@ -955,7 +953,7 @@ class EchoFocus:
             if total_epochs < 1:
                 total_epochs = 1
             self.epoch_early_stop = 1
-            self.sample_limit = min(self.sample_limit, self.smoke_num_samples)
+            self.sample_limit = min(self.sample_limit, 5000)
             smoke_steps = self.smoke_num_steps
             print(
                 "smoke_train enabled:",
