@@ -214,6 +214,7 @@ class VideoClipDataset(torch.utils.data.Dataset):
         clip_len=16,
         use_hdf5_index=False,
         video_subdir_format="{echo_id}_trim",
+        max_videos_per_study=None,
     ):
         """Create a dataset for loading raw video clips.
 
@@ -227,6 +228,7 @@ class VideoClipDataset(torch.utils.data.Dataset):
             clip_len (int): Frames per clip.
             use_hdf5_index (bool): Use embedding HDF5 files to locate video paths.
             video_subdir_format (str): Format for study folder under base_path.
+            max_videos_per_study (int|None): Optional cap on videos per study.
         """
         self.embed_path = embed_path
         self.embedding_echo_id_list = embedding_echo_id_list
@@ -237,6 +239,7 @@ class VideoClipDataset(torch.utils.data.Dataset):
         self.clip_len = clip_len
         self.use_hdf5_index = use_hdf5_index
         self.video_subdir_format = video_subdir_format
+        self.max_videos_per_study = max_videos_per_study
         self.keychain = []
         self.store_keychain = True
         self.video_cache = {}
@@ -311,6 +314,9 @@ class VideoClipDataset(torch.utils.data.Dataset):
             return self.video_cache[echo_id], echo_id
 
         study_filenames, _ = self.get_filenames_by_echo_id(echo_id)
+        if self.max_videos_per_study is not None:
+            perm = np.random.permutation(len(study_filenames))
+            study_filenames = study_filenames[perm][: int(self.max_videos_per_study)]
         study_clips = []
         for file_path in study_filenames:
             clip_tensor = pull_clips(
@@ -453,6 +459,7 @@ def get_video_dataset(
     base_path="/lab-share/Cardio-Mayourian-e2/Public/Echo_Pulled",
     use_hdf5_index=False,
     video_subdir_format="{echo_id}_trim",
+    max_videos_per_study=None,
 ):
     """Create a dataset that loads raw clips on demand."""
     return VideoClipDataset(
@@ -465,6 +472,7 @@ def get_video_dataset(
         base_path=base_path,
         use_hdf5_index=use_hdf5_index,
         video_subdir_format=video_subdir_format,
+        max_videos_per_study=max_videos_per_study,
     )
     # print('Starting Embedding Pull')
     # start = time.time()

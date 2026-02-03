@@ -16,6 +16,7 @@ import torch
 import time
 from datetime import datetime
 import sys
+import torch.profiler
 
 # import cv2
 import numpy as np
@@ -71,11 +72,16 @@ class EchoFocus:
         embedding_path=None,
         video_base_path="/lab-share/Cardio-Mayourian-e2/Public/Echo_Pulled",
         video_subdir_format="{echo_id}_trim",
+        max_videos_per_study=None,
         smoke_train=False,
         smoke_num_steps=2,
         debug_mem=False,
         amp=False,
         checkpoint_panecho=False,
+        profile=False,
+        profile_steps=20,
+        profile_dir="profiles",
+        timing_every=10,
     ):
         """Initialize training/evaluation state and load config.
 
@@ -108,11 +114,16 @@ class EchoFocus:
             use_hdf5_index (bool): Use embedding HDF5s to locate video paths.
             video_base_path (str): Base path for raw study folders.
             video_subdir_format (str): Format for study folder under base path.
+            max_videos_per_study (int|None): Optional cap on videos per study.
             smoke_train (bool): If True, run a minimal smoke-training pass.
             smoke_num_steps (int): Number of batches per epoch for smoke training.
             debug_mem (bool): If True, print CUDA memory stats for first batch each epoch.
             amp (bool): If True, use autocast + GradScaler mixed precision.
             checkpoint_panecho (bool): If True, checkpoint PanEcho forward to save memory.
+            profile (bool): If True, run PyTorch profiler for a short window.
+            profile_steps (int): Number of steps to profile.
+            profile_dir (str): Output directory for profiler traces.
+            timing_every (int): Print timing stats every N batches.
         """
         self.time = time.time()
         self.datetime = str(datetime.now()).replace(" ", "_")
@@ -394,6 +405,7 @@ class EchoFocus:
                 base_path=self.video_base_path,
                 use_hdf5_index=self.use_hdf5_index,
                 video_subdir_format=self.video_subdir_format,
+                max_videos_per_study=self.max_videos_per_study,
             )
             test_dataset = CustomDataset(Test_DF, test_embeddings, self.task_labels)
         else:
@@ -420,13 +432,14 @@ class EchoFocus:
                     Train_DF.index.values,
                     transforms=train_transform,
                     cache_clips=self.cache_embeddings,
-                    num_clips=self.num_clips,
-                    clip_len=self.clip_len,
-                    base_path=self.video_base_path,
-                    use_hdf5_index=self.use_hdf5_index,
-                    video_subdir_format=self.video_subdir_format,
-                )
-                train_dataset = CustomDataset(Train_DF, train_embeddings, self.task_labels)
+                num_clips=self.num_clips,
+                clip_len=self.clip_len,
+                base_path=self.video_base_path,
+                use_hdf5_index=self.use_hdf5_index,
+                video_subdir_format=self.video_subdir_format,
+                max_videos_per_study=self.max_videos_per_study,
+            )
+            train_dataset = CustomDataset(Train_DF, train_embeddings, self.task_labels)
             else:
                 train_dataset = CustomDataset(Train_DF, study_embeddings, self.task_labels)  # , study_filenames)
             if self.sample_limit < len(train_dataset):
@@ -448,13 +461,14 @@ class EchoFocus:
                     Valid_DF.index.values,
                     transforms=Test_Transforms,
                     cache_clips=self.cache_embeddings,
-                    num_clips=self.num_clips,
-                    clip_len=self.clip_len,
-                    base_path=self.video_base_path,
-                    use_hdf5_index=self.use_hdf5_index,
-                    video_subdir_format=self.video_subdir_format,
-                )
-                valid_dataset = CustomDataset(Valid_DF, valid_embeddings, self.task_labels)
+                num_clips=self.num_clips,
+                clip_len=self.clip_len,
+                base_path=self.video_base_path,
+                use_hdf5_index=self.use_hdf5_index,
+                video_subdir_format=self.video_subdir_format,
+                max_videos_per_study=self.max_videos_per_study,
+            )
+            valid_dataset = CustomDataset(Valid_DF, valid_embeddings, self.task_labels)
             else:
                 valid_dataset = CustomDataset(Valid_DF, study_embeddings, self.task_labels) #, study_filenames)
             if self.sample_limit < len(valid_dataset):
@@ -795,6 +809,23 @@ class EchoFocus:
     ):
         """Run the main training loop with an optional per-epoch hook."""
         print('begin training loop')
+        prof = None
+        profile_steps = int(self.profile_steps) if self.profile_steps is not None else 0
+        profile_steps = max(0, profile_steps)
+        if self.profile and profile_steps > 0:
+            os.makedirs(self.profile_dir, exist_ok=True)
+            prof = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ] if torch.cuda.is_available() else [torch.profiler.ProfilerActivity.CPU],
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=False,
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(self.profile_dir),
+            )
+            prof.start()
+
         def _mem(tag):
             if not torch.cuda.is_available():
                 return
@@ -804,6 +835,8 @@ class EchoFocus:
             max_alloc = torch.cuda.max_memory_allocated() / 1024**3
             print(f"[mem] {tag}: alloc={alloc:.2f}G reserved={reserved:.2f}G max={max_alloc:.2f}G")
 
+        global_step = 0
+        prev_batch_end = None
         while (current_epoch < self.total_epochs) and (
             current_epoch - best_epoch < self.epoch_early_stop
         ):
@@ -822,51 +855,108 @@ class EchoFocus:
                 desc=f"Epoch {current_epoch}",
                 total=len(train_dataloader),
             ):
+                batch_start = time.time()
+                data_wait = None
+                if prev_batch_end is not None:
+                    data_wait = batch_start - prev_batch_end
+
                 if (torch.cuda.is_available()):
                     Embedding = Embedding.to('cuda')
                     Correct_Out = Correct_Out.to('cuda')
                     
                 if self.debug_mem and batch_count == 0:
                     _mem("before forward")
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                t_fwd_start = time.time()
                 with torch.amp.autocast("cuda", enabled=self.amp):
                     out = self.model(Embedding)
                     train_loss = self.loss_fn(out, Correct_Out)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                t_fwd_end = time.time()
                 if self.debug_mem and batch_count == 0:
                     _mem("after forward")
                 if self.debug_mem and batch_count == 0:
                     _mem("after loss")
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                t_bwd_start = time.time()
                 if self.amp:
                     self.scaler.scale(train_loss).backward()
                 else:
                     train_loss.backward()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                t_bwd_end = time.time()
                 if self.debug_mem and batch_count == 0:
                     _mem("after backward")
                 train_loss_total += train_loss.item()
                 
+                step_performed = False
                 if ( (batch_count+1) % self.batch_number ==0) :           
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    t_step_start = time.time()
                     if self.amp:
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
                     else:
                         self.optimizer.step()
                     self.model.zero_grad()
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    t_step_end = time.time()
+                    step_performed = True
                 elif ( (batch_count+1) == len(train_dataloader) ):
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    t_step_start = time.time()
                     if self.amp:
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
                     else:
                         self.optimizer.step()
                     self.model.zero_grad()
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    t_step_end = time.time()
+                    step_performed = True
 
                 if smoke_steps is not None and (batch_count + 1) >= smoke_steps:
                     if (batch_count + 1) % self.batch_number != 0:
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                        t_step_start = time.time()
                         if self.amp:
                             self.scaler.step(self.optimizer)
                             self.scaler.update()
                         else:
                             self.optimizer.step()
                         self.model.zero_grad()
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                        t_step_end = time.time()
+                        step_performed = True
                     break
+                
+                if prof is not None and global_step < profile_steps:
+                    prof.step()
+                if prof is not None and global_step == profile_steps:
+                    prof.stop()
+                    prof = None
+                
+                if self.timing_every and (batch_count + 1) % int(self.timing_every) == 0:
+                    step_time = (t_step_end - t_step_start) if step_performed else 0.0
+                    total_time = time.time() - batch_start
+                    data_wait_s = data_wait if data_wait is not None else 0.0
+                    print(
+                        f"[timing] batch={batch_count+1} data_wait={data_wait_s:.2f}s "
+                        f"fwd={t_fwd_end - t_fwd_start:.2f}s bwd={t_bwd_end - t_bwd_start:.2f}s "
+                        f"step={step_time:.2f}s total={total_time:.2f}s"
+                    )
+                prev_batch_end = time.time()
+                global_step += 1
                     
             epoch_end_time = time.time()
             
@@ -918,6 +1008,10 @@ class EchoFocus:
             if current_epoch - best_epoch == self.epoch_early_stop:
                 print('early stopping')
             
+        if prof is not None:
+            prof.stop()
+            prof = None
+
         utils.plot_training_progress( self.model_path, self.perf_log)
         print('Training Completed')
         
