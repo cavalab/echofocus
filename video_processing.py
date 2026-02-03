@@ -70,13 +70,26 @@ def pull_clip(file_loc, transform_func, clip_len=16):
     capture.set(cv2.CAP_PROP_POS_FRAMES, start_idx - 1)
 
     frames = []
+    last_frame = None
     for i in range(clip_len):
         if i < frame_count:
             ret, frame = capture.read()
-            frame = cv2.resize(frame, (256, 256), interpolation=cv2.INTER_AREA)
+            if not ret or frame is None:
+                print(f"warning: failed to read frame from {file_loc}")
+                if last_frame is None:
+                    # Fallback to a black frame if the first read fails
+                    frame = np.zeros((256, 256, 3), dtype=np.uint8)
+                else:
+                    frame = last_frame
+            else:
+                frame = cv2.resize(frame, (256, 256), interpolation=cv2.INTER_AREA)
+            last_frame = frame
             frames.append(frame)
         else:
-            frames.append(frame)  # "last image carried forward"
+            # "last image carried forward"
+            if last_frame is None:
+                last_frame = np.zeros((256, 256, 3), dtype=np.uint8)
+            frames.append(last_frame)
 
     frames = np.stack(frames, axis=0)  # f x h x w x 3
     frames = tv_tensors.Video(np.transpose(frames, (0, 3, 1, 2)))  # f x 3 x h x w

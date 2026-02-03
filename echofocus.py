@@ -169,7 +169,8 @@ class EchoFocus:
         # 2. Set random seeds 
         np.random.seed(seed)
         torch.manual_seed(seed)
-        torch.backends.cudnn.deterministic = True # make TRUE if you want reproducible results (slower)     
+        torch.backends.cudnn.deterministic = False  # faster kernels, non-deterministic
+        torch.backends.cudnn.benchmark = True       # auto-tune cuDNN for fixed input sizes
          
         # set model name 
         if not model_name:
