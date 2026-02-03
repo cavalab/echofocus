@@ -17,6 +17,8 @@ import time
 from datetime import datetime
 import sys
 import torch.profiler
+import threading
+import subprocess
 
 # import cv2
 import numpy as np
@@ -83,6 +85,8 @@ class EchoFocus:
         profile_dir="profiles",
         timing_every=10,
         profile_summary=False,
+        gpu_monitor=False,
+        gpu_monitor_interval=10,
     ):
         """Initialize training/evaluation state and load config.
 
@@ -126,6 +130,8 @@ class EchoFocus:
             profile_dir (str): Output directory for profiler traces.
             timing_every (int): Print timing stats every N batches.
             profile_summary (bool): If True, print a summary table after profiling.
+            gpu_monitor (bool): If True, log GPU utilization periodically.
+            gpu_monitor_interval (int): Seconds between GPU utilization logs.
         """
         self.time = time.time()
         self.datetime = str(datetime.now()).replace(" ", "_")
@@ -190,6 +196,33 @@ class EchoFocus:
 
         self._load_config()
         self._set_loss()
+
+    def _start_gpu_monitor(self):
+        if not self.gpu_monitor:
+            return None, None
+        stop_event = threading.Event()
+
+        def _worker():
+            while not stop_event.is_set():
+                try:
+                    out = subprocess.check_output(
+                        [
+                            "nvidia-smi",
+                            "--query-gpu=timestamp,utilization.gpu,utilization.memory,memory.used,memory.total",
+                            "--format=csv,noheader,nounits",
+                        ],
+                        stderr=subprocess.DEVNULL,
+                        text=True,
+                    ).strip()
+                    if out:
+                        print(f"[gpu] {out}")
+                except Exception:
+                    pass
+                stop_event.wait(self.gpu_monitor_interval)
+
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+        return thread, stop_event
 
     def _embedding_eids_from_path(self):
         """Return echo IDs available under the embedding path."""
@@ -817,6 +850,10 @@ class EchoFocus:
     ):
         """Run the main training loop with an optional per-epoch hook."""
         print('begin training loop')
+        monitor_thread = None
+        monitor_stop = None
+        if self.gpu_monitor:
+            monitor_thread, monitor_stop = self._start_gpu_monitor()
         prof = None
         prof_records = []
         profile_steps = int(self.profile_steps) if self.profile_steps is not None else 0
@@ -1035,6 +1072,11 @@ class EchoFocus:
                 print(summary)
             except Exception as e:
                 print(f"warning: failed to print profiler summary: {e}")
+
+        if monitor_stop is not None:
+            monitor_stop.set()
+        if monitor_thread is not None:
+            monitor_thread.join(timeout=1.0)
 
         utils.plot_training_progress( self.model_path, self.perf_log)
         print('Training Completed')
