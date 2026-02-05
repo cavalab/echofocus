@@ -487,12 +487,12 @@ def get_dataset(
             embed_path, embedding_echo_id_list, cache_embeddings=cache_embeddings
         )
     else:
-    emb_ds = EmbeddingDataset(
-        embed_path,
-        embedding_echo_id_list,
-        cache_embeddings=cache_embeddings,
-        max_cache_gb=max_cache_gb,
-    )
+        emb_ds = EmbeddingDataset(
+            embed_path,
+            embedding_echo_id_list,
+            cache_embeddings=cache_embeddings,
+            max_cache_gb=max_cache_gb,
+        )
     # todo: pass n workers to embeddingdataset
     if not preload:
         return emb_ds
