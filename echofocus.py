@@ -21,6 +21,7 @@ import threading
 import subprocess
 import os
 import torch.multiprocessing as mp
+from collections import OrderedDict
 
 # import cv2
 import numpy as np
@@ -65,7 +66,8 @@ class EchoFocus:
         preload_embeddings=False,
         run_id=None,
         config='config.json',
-        cache_embeddings=False,
+        cache_video_tensors=False,
+        cache_panecho_embeddings=False,
         end_to_end=True,
         panecho_trainable=True,
         transformer_trainable=True,
@@ -77,7 +79,8 @@ class EchoFocus:
         video_base_path="/lab-share/Cardio-Mayourian-e2/Public/Echo_Pulled",
         video_subdir_format="{echo_id}_trim",
         max_videos_per_study=None,
-        max_cache_gb=250,
+        max_video_cache_gb=250,
+        max_panecho_cache_gb=None,
         smoke_train=False,
         smoke_num_steps=2,
         debug_mem=False,
@@ -116,7 +119,8 @@ class EchoFocus:
             sample_limit (int): Limit number of samples.
             run_id (str|None): Optional run ID for reproducibility.
             config (str): Path to config JSON file.
-            cache_embeddings (bool): Cache embeddings in memory.
+            cache_video_tensors (bool): Cache raw video clips in memory (end-to-end only).
+            cache_panecho_embeddings (bool): Cache PanEcho embeddings (end-to-end frozen) or precomputed embeddings (non end-to-end).
             end_to_end (bool): If True, train end-to-end with PanEcho backbone.
             panecho_trainable (bool): If True, fine-tune the PanEcho backbone.
             transformer_trainable (bool): If True, train the study-level transformer.
@@ -126,7 +130,8 @@ class EchoFocus:
             video_base_path (str): Base path for raw study folders.
             video_subdir_format (str): Format for study folder under base path.
             max_videos_per_study (int|None): Optional cap on videos per study.
-            max_cache_gb (float|None): Optional RAM cache cap in GB.
+            max_video_cache_gb (float|None): Optional RAM cache cap for video tensors.
+            max_panecho_cache_gb (float|None): Optional RAM cache cap for PanEcho embeddings.
             smoke_train (bool): If True, run a minimal smoke-training pass.
             smoke_num_steps (int): Number of batches per epoch for smoke training.
             debug_mem (bool): If True, print CUDA memory stats for first batch each epoch.
@@ -150,6 +155,13 @@ class EchoFocus:
         else:
             self.run_id = f"{self.datetime}_{uuid.uuid4()}"
 
+        self.cache_video_tensors = cache_video_tensors
+        self.cache_panecho_embeddings = cache_panecho_embeddings
+        self.max_video_cache_gb = max_video_cache_gb
+        self.max_panecho_cache_gb = max_panecho_cache_gb
+        self._panecho_cache = OrderedDict()
+        self._panecho_cache_bytes = 0
+
         if "TORCH_SHM_DIR" not in os.environ:
             tmp_base = os.environ.get("TMPDIR") or os.environ.get("TMP") or os.environ.get("TEMP")
             if tmp_base:
@@ -172,6 +184,16 @@ class EchoFocus:
             f"TORCH_SHM_DIR={os.environ.get('TORCH_SHM_DIR', '')}",
             f"TMPDIR={os.environ.get('TMPDIR', '')}",
             f"/dev/shm={shm_line}",
+        )
+        print(
+            "cache:",
+            f"video_tensors={self.cache_video_tensors}",
+            f"panecho_embeddings={self.cache_panecho_embeddings}",
+            f"max_video_cache_gb={self.max_video_cache_gb}",
+            f"max_panecho_cache_gb={self.max_panecho_cache_gb}",
+            f"num_clips={self.num_clips}",
+            f"clip_len={self.clip_len}",
+            f"max_videos_per_study={self.max_videos_per_study}",
         )
 
         assert batch_size==1, "only batch_size=1 currently supported"
@@ -293,6 +315,33 @@ class EchoFocus:
         thread = threading.Thread(target=_worker, daemon=True)
         thread.start()
         return thread, stop_event
+
+    def _panecho_cache_get(self, eid):
+        if eid in self._panecho_cache:
+            value = self._panecho_cache.pop(eid)
+            self._panecho_cache[eid] = value
+            return value
+        return None
+
+    def _panecho_cache_put(self, eid, value):
+        if not self.cache_panecho_embeddings:
+            return
+        if self.max_panecho_cache_gb is None:
+            self._panecho_cache[eid] = value
+            return
+        max_bytes = int(self.max_panecho_cache_gb * (1024 ** 3))
+        size = value.numel() * value.element_size()
+        if size > max_bytes:
+            return
+        while self._panecho_cache_bytes + size > max_bytes and len(self._panecho_cache) > 0:
+            _, evicted = self._panecho_cache.popitem(last=False)
+            self._panecho_cache_bytes -= evicted.numel() * evicted.element_size()
+        self._panecho_cache[eid] = value
+        self._panecho_cache_bytes += size
+
+    def _panecho_cache_clear(self):
+        self._panecho_cache.clear()
+        self._panecho_cache_bytes = 0
 
     def _embedding_eids_from_path(self):
         """Return echo IDs available under the embedding path."""
@@ -426,8 +475,8 @@ class EchoFocus:
                 eid_keep_list,
                 limit=self.sample_limit,
                 parallel_processes=self.parallel_processes,
-                cache_embeddings=self.cache_embeddings,
-                max_cache_gb=self.max_cache_gb,
+                cache_embeddings=self.cache_panecho_embeddings,
+                max_cache_gb=self.max_panecho_cache_gb,
                 batch_size=self.batch_size
             )
         # print('Total videos included: ',sum([study_embeddings[key].shape[0] for key in study_embeddings.keys()]))
@@ -505,14 +554,14 @@ class EchoFocus:
                 self.embedding_path,
                 Test_DF.index.values,
                 transforms=Test_Transforms,
-                cache_clips=self.cache_embeddings,
+                cache_clips=self.cache_video_tensors,
                 num_clips=self.num_clips,
                 clip_len=self.clip_len,
                 base_path=self.video_base_path,
                 use_hdf5_index=self.use_hdf5_index,
                 video_subdir_format=self.video_subdir_format,
                 max_videos_per_study=self.max_videos_per_study,
-                max_cache_gb=self.max_cache_gb,
+                max_cache_gb=self.max_video_cache_gb,
             )
             test_dataset = CustomDataset(Test_DF, test_embeddings, self.task_labels)
         else:
@@ -541,14 +590,14 @@ class EchoFocus:
                     self.embedding_path,
                     Train_DF.index.values,
                     transforms=train_transform,
-                cache_clips=self.cache_embeddings,
+                cache_clips=self.cache_video_tensors,
                 num_clips=self.num_clips,
                 clip_len=self.clip_len,
                 base_path=self.video_base_path,
                 use_hdf5_index=self.use_hdf5_index,
                 video_subdir_format=self.video_subdir_format,
                 max_videos_per_study=self.max_videos_per_study,
-                max_cache_gb=self.max_cache_gb,
+                max_cache_gb=self.max_video_cache_gb,
             )
                 train_dataset = CustomDataset(Train_DF, train_embeddings, self.task_labels)
             else:
@@ -574,14 +623,14 @@ class EchoFocus:
                     self.embedding_path,
                     Valid_DF.index.values,
                     transforms=Test_Transforms,
-                cache_clips=self.cache_embeddings,
+                cache_clips=self.cache_video_tensors,
                 num_clips=self.num_clips,
                 clip_len=self.clip_len,
                 base_path=self.video_base_path,
                 use_hdf5_index=self.use_hdf5_index,
                 video_subdir_format=self.video_subdir_format,
                 max_videos_per_study=self.max_videos_per_study,
-                max_cache_gb=self.max_cache_gb,
+                max_cache_gb=self.max_video_cache_gb,
             )
                 valid_dataset = CustomDataset(Valid_DF, valid_embeddings, self.task_labels)
             else:
@@ -974,6 +1023,9 @@ class EchoFocus:
                 self._set_trainable_flags()
                 for pg in self.optimizer.param_groups:
                     pg['lr'] = self.learning_rate
+            if self.panecho_trainable and len(self._panecho_cache) > 0:
+                print("clearing cached panecho embeddings (panecho_trainable=True)")
+                self._panecho_cache_clear()
 
             self.model.train()
             epoch_start_time = time.time()
@@ -1007,7 +1059,22 @@ class EchoFocus:
                     torch.cuda.synchronize()
                 t_fwd_start = time.time()
                 with torch.amp.autocast("cuda", enabled=self.amp):
-                    out = self.model(Embedding)
+                    if self.end_to_end and self.cache_panecho_embeddings and not self.panecho_trainable:
+                        eid_val = EID[0] if isinstance(EID, (list, tuple, np.ndarray)) else EID
+                        try:
+                            eid_key = int(eid_val)
+                        except Exception:
+                            eid_key = str(eid_val)
+                        cached = self._panecho_cache_get(eid_key)
+                        if cached is not None:
+                            emb = cached.to(Embedding.device)
+                        else:
+                            with torch.no_grad():
+                                emb = self.model._panecho_embed(Embedding)
+                            self._panecho_cache_put(eid_key, emb.detach().cpu())
+                        out = self.model.transformer(emb)
+                    else:
+                        out = self.model(Embedding)
                     train_loss = self.loss_fn(out, Correct_Out)
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
