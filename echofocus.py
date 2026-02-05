@@ -71,6 +71,9 @@ class EchoFocus:
         end_to_end=True,
         panecho_trainable=True,
         transformer_trainable=True,
+        load_transformer_path=None,
+        load_panecho_path=None,
+        load_strict=False,
         num_clips=16,
         clip_len=16,
         use_hdf5_index=False,
@@ -124,6 +127,9 @@ class EchoFocus:
             end_to_end (bool): If True, train end-to-end with PanEcho backbone.
             panecho_trainable (bool): If True, fine-tune the PanEcho backbone.
             transformer_trainable (bool): If True, train the study-level transformer.
+            load_transformer_path (str|None): Optional path to load transformer weights.
+            load_panecho_path (str|None): Optional path to load PanEcho weights.
+            load_strict (bool): If True, enforce strict loading for submodules.
             num_clips (int): Number of clips sampled per video.
             clip_len (int): Frames per clip.
             use_hdf5_index (bool): Use embedding HDF5s to locate video paths.
@@ -315,6 +321,19 @@ class EchoFocus:
         thread = threading.Thread(target=_worker, daemon=True)
         thread.start()
         return thread, stop_event
+
+    def _load_submodule_weights(self, module, path, prefix=None):
+        if path is None:
+            return
+        ckpt = torch.load(path, map_location="cpu")
+        state = ckpt.get("model_state_dict", ckpt)
+        if prefix:
+            state = {k[len(prefix):]: v for k, v in state.items() if k.startswith(prefix)}
+        missing, unexpected = module.load_state_dict(state, strict=self.load_strict)
+        if missing or unexpected:
+            print(
+                f"WARNING: load from {path} missing={len(missing)} unexpected={len(unexpected)}"
+            )
 
     def _panecho_cache_get(self, eid):
         if eid in self._panecho_cache:
@@ -918,6 +937,16 @@ class EchoFocus:
             best_epoch = 0
             best_loss = 1e10
 
+        # override submodule weights after any full checkpoint load
+        if self.end_to_end:
+            if self.load_panecho_path:
+                self._load_submodule_weights(self.model.panecho, self.load_panecho_path, prefix="panecho.")
+            if self.load_transformer_path:
+                self._load_submodule_weights(self.model.transformer, self.load_transformer_path, prefix="transformer.")
+        else:
+            if self.load_transformer_path:
+                self._load_submodule_weights(self.model, self.load_transformer_path, prefix="transformer.")
+
         # return model
         return self.model, current_epoch, best_epoch, best_loss, input_norm_dict
 
@@ -1339,11 +1368,28 @@ class EchoFocus:
             return
         # Run on test dataset
         print(f'run model on {fold} set')
+        def _cache_hook(embedding, eid):
+            if self.end_to_end and self.cache_panecho_embeddings and not self.panecho_trainable:
+                eid_val = eid[0] if isinstance(eid, (list, tuple, np.ndarray)) else eid
+                try:
+                    eid_key = int(eid_val)
+                except Exception:
+                    eid_key = str(eid_val)
+                cached = self._panecho_cache_get(eid_key)
+                if cached is not None:
+                    emb = cached.to(embedding.device)
+                else:
+                    emb = model._panecho_embed(embedding)
+                    self._panecho_cache_put(eid_key, emb.detach().cpu())
+                return model.transformer(emb)
+            return model(embedding)
+
         y_true, y_pred, EIDs, loss = run_model_on_dataloader(
             model,
             dataloader,
             self.loss_fn,
             amp=self.amp,
+            cache_hook=_cache_hook,
         )
         # convert model outputs back
         y_true = np.array(y_true).squeeze()
@@ -1703,7 +1749,7 @@ def load_model_and_random_state(path, model, optimizer=None, scheduler=None):
     return model, optimizer, scheduler, perf_log, input_norm_dict
 
 
-def run_model_on_dataloader(model, dataloader, loss_func_pointer, amp=False):
+def run_model_on_dataloader(model, dataloader, loss_func_pointer, amp=False, cache_hook=None):
     """Run inference on a dataloader and collect outputs.
 
     Args:
@@ -1728,10 +1774,12 @@ def run_model_on_dataloader(model, dataloader, loss_func_pointer, amp=False):
             embedding = embedding.to("cuda")
             correct_labels = correct_labels.to("cuda")
 
-
         with torch.no_grad():
             with torch.amp.autocast("cuda", enabled=use_amp):
-                model_outputs = model(embedding)
+                if cache_hook is not None:
+                    model_outputs = cache_hook(embedding, eid)
+                else:
+                    model_outputs = model(embedding)
             return_model_outputs.append(model_outputs.to('cpu'))
             return_correct_outputs.append(correct_labels.to('cpu'))
             return_EIDs.append(eid)
