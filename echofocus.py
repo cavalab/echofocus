@@ -1460,8 +1460,12 @@ class EchoFocus:
         low, high = np.percentile(np.array(bootstrap_values), list(ci_percentiles))
         return metric_value, float(low), float(high), len(bootstrap_values)
 
-    def get_metrics(self, fold='test', dataset=None, n_bootstrap=1000):
+    def get_metrics(self, fold='test', dataset=None, n_bootstrap=1000, model_name=None):
         """Compute task metrics from saved predictions and write JSON output."""
+        if model_name is not None:
+            self.model_name = model_name
+            self.model_path = os.path.join('./trained_models', model_name)
+
         if dataset is None:
             dataset = self.dataset
         saveout_path = os.path.join(self.model_path, f'saveout_{fold}_{dataset}.csv')
