@@ -21,6 +21,7 @@ import threading
 import subprocess
 import torch.multiprocessing as mp
 from collections import OrderedDict
+from sklearn.metrics import roc_auc_score, average_precision_score, median_absolute_error, r2_score
 
 # import cv2
 import numpy as np
@@ -1416,6 +1417,162 @@ class EchoFocus:
 
         if self.task == 'measure': 
             utils.scatter_plots(self.model_path, self.dataset, fold, self.task_labels, y_true, y_pred)
+
+    def _bootstrap_metric_ci(
+        self,
+        y_true,
+        y_pred,
+        metric_fn,
+        rng,
+        n_bootstrap=1000,
+        ci_percentiles=(2.5, 97.5),
+        require_two_classes=False,
+    ):
+        """Compute metric value and bootstrap confidence interval."""
+        if y_true.size == 0:
+            return None, None, None, 0
+        if require_two_classes and np.unique(y_true).size < 2:
+            return None, None, None, 0
+
+        try:
+            metric_value = float(metric_fn(y_true, y_pred))
+        except ValueError:
+            metric_value = None
+
+        bootstrap_values = []
+        n = y_true.shape[0]
+        for _ in range(int(n_bootstrap)):
+            idx = rng.integers(0, n, size=n)
+            yb_true = y_true[idx]
+            yb_pred = y_pred[idx]
+            if require_two_classes and np.unique(yb_true).size < 2:
+                continue
+            try:
+                val = metric_fn(yb_true, yb_pred)
+            except ValueError:
+                continue
+            if np.isfinite(val):
+                bootstrap_values.append(float(val))
+
+        if len(bootstrap_values) == 0:
+            return metric_value, None, None, 0
+
+        low, high = np.percentile(np.array(bootstrap_values), list(ci_percentiles))
+        return metric_value, float(low), float(high), len(bootstrap_values)
+
+    def get_metrics(self, fold='test', dataset=None, n_bootstrap=1000):
+        """Compute task metrics from saved predictions and write JSON output."""
+        if dataset is None:
+            dataset = self.dataset
+        saveout_path = os.path.join(self.model_path, f'saveout_{fold}_{dataset}.csv')
+        if not os.path.exists(saveout_path):
+            print(f'WARNING: saveout file not found, skipping metrics: {saveout_path}')
+            return None
+
+        df = pd.read_csv(saveout_path)
+        rng = np.random.default_rng(self.seed)
+        out = {
+            'task': self.task,
+            'dataset': dataset,
+            'fold': fold,
+            'n_bootstrap': int(n_bootstrap),
+            'metrics': {},
+        }
+
+        y_true_all = []
+        y_pred_all = []
+        valid_labels = []
+
+        for label in self.task_labels:
+            true_col = f'{label}_Correct'
+            pred_col = f'{label}_Predict'
+            if true_col not in df.columns or pred_col not in df.columns:
+                print(f'WARNING: missing columns for label {label}, skipping')
+                continue
+
+            y_true = pd.to_numeric(df[true_col], errors='coerce').to_numpy(dtype=float)
+            y_pred = pd.to_numeric(df[pred_col], errors='coerce').to_numpy(dtype=float)
+            mask = np.isfinite(y_true) & np.isfinite(y_pred)
+            y_true = y_true[mask]
+            y_pred = y_pred[mask]
+
+            label_metrics = {'n_samples': int(y_true.shape[0])}
+            if self.task in ['chd', 'fyler']:
+                roc_val, roc_lo, roc_hi, roc_eff_n = self._bootstrap_metric_ci(
+                    y_true,
+                    y_pred,
+                    roc_auc_score,
+                    rng=rng,
+                    n_bootstrap=n_bootstrap,
+                    require_two_classes=True,
+                )
+                ap_val, ap_lo, ap_hi, ap_eff_n = self._bootstrap_metric_ci(
+                    y_true,
+                    y_pred,
+                    average_precision_score,
+                    rng=rng,
+                    n_bootstrap=n_bootstrap,
+                    require_two_classes=True,
+                )
+                label_metrics['roc_auc_score'] = {
+                    'value': roc_val,
+                    'ci_lower': roc_lo,
+                    'ci_upper': roc_hi,
+                    'n_bootstrap_effective': roc_eff_n,
+                }
+                label_metrics['average_precision'] = {
+                    'value': ap_val,
+                    'ci_lower': ap_lo,
+                    'ci_upper': ap_hi,
+                    'n_bootstrap_effective': ap_eff_n,
+                }
+                y_true_all.append(y_true)
+                y_pred_all.append(y_pred)
+                valid_labels.append(label)
+            elif self.task == 'measure':
+                mae_val, mae_lo, mae_hi, mae_eff_n = self._bootstrap_metric_ci(
+                    y_true,
+                    y_pred,
+                    median_absolute_error,
+                    rng=rng,
+                    n_bootstrap=n_bootstrap,
+                )
+                r2_val, r2_lo, r2_hi, r2_eff_n = self._bootstrap_metric_ci(
+                    y_true,
+                    y_pred,
+                    r2_score,
+                    rng=rng,
+                    n_bootstrap=n_bootstrap,
+                )
+                label_metrics['median_absolute_error'] = {
+                    'value': mae_val,
+                    'ci_lower': mae_lo,
+                    'ci_upper': mae_hi,
+                    'n_bootstrap_effective': mae_eff_n,
+                }
+                label_metrics['r2_score'] = {
+                    'value': r2_val,
+                    'ci_lower': r2_lo,
+                    'ci_upper': r2_hi,
+                    'n_bootstrap_effective': r2_eff_n,
+                }
+            out['metrics'][label] = label_metrics
+
+        metrics_path = os.path.join(self.model_path, f'metrics_{fold}_{dataset}.json')
+        with open(metrics_path, 'w') as f:
+            json.dump(out, f, indent=2)
+        print('writing', metrics_path)
+
+        if self.task in ['chd', 'fyler'] and len(valid_labels) > 0:
+            max_n = max(arr.shape[0] for arr in y_true_all)
+            y_true_mat = np.full((max_n, len(valid_labels)), np.nan)
+            y_pred_mat = np.full((max_n, len(valid_labels)), np.nan)
+            for i, (yt, yp) in enumerate(zip(y_true_all, y_pred_all)):
+                y_true_mat[: yt.shape[0], i] = yt
+                y_pred_mat[: yp.shape[0], i] = yp
+            utils.plot_roc_curves(self.model_path, dataset, fold, valid_labels, y_true_mat, y_pred_mat)
+            utils.plot_pr_curves(self.model_path, dataset, fold, valid_labels, y_true_mat, y_pred_mat)
+        return out
         
             
     def evaluate(self):
@@ -1434,8 +1591,9 @@ class EchoFocus:
             use_train_transforms=False,
         )
 
-        for fold,dataloader in zip((train_dl,val_dl,test_dl),('train','val','test')):
-            self._evaluate(model, dataloader, fold, input_norm_dict)
+        for dataloader, fold in zip((train_dl, val_dl, test_dl), ('train', 'val', 'test')):
+            self._evaluate(best_model, dataloader, fold, input_norm_dict)
+            self.get_metrics(fold=fold, dataset=self.dataset)
             print('eval time taken: ', time.time() - eval_start_time)
 
     def _set_loss(self):

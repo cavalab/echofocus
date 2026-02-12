@@ -1,12 +1,14 @@
 """Utility functions for normalization, plotting, and reproducibility."""
 
 import os
+import math
 import numpy as np
 import scipy
 import torch
 import inspect
 from functools import wraps
 import matplotlib.pyplot as plt
+from sklearn.metrics import roc_curve, roc_auc_score, precision_recall_curve, average_precision_score
 
 def get_norm_params(train_df, measure_list):
     """Compute per-measure normalization parameters for label transforms.
@@ -233,6 +235,83 @@ def scatter_plots(model_path, dataset, fold, task_labels, y_true, y_pred):
     plt.tight_layout()
     print('saving',figure_loc)
     fig.savefig(figure_loc, bbox_inches = 'tight')
+    plt.close(fig)
+
+
+def _make_subplot_grid(num_panels, max_cols=4, panel_width=4, panel_height=3.5):
+    """Create a subplot grid and return (fig, flat_axes)."""
+    n_cols = min(max_cols, max(1, num_panels))
+    n_rows = int(math.ceil(num_panels / n_cols))
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(panel_width * n_cols, panel_height * n_rows),
+        squeeze=False,
+    )
+    return fig, axes.flatten()
+
+
+def plot_roc_curves(model_path, dataset, fold, task_labels, y_true, y_score):
+    """Save per-label ROC curves for classification tasks."""
+    figure_loc = os.path.join(model_path, f'roc_curves_{fold}_{dataset}.pdf')
+    fig, axes = _make_subplot_grid(len(task_labels))
+    for i, label in enumerate(task_labels):
+        ax = axes[i]
+        yt = y_true[:, i]
+        ys = y_score[:, i]
+        mask = np.isfinite(yt) & np.isfinite(ys)
+        yt = yt[mask]
+        ys = ys[mask]
+        if yt.size == 0 or np.unique(yt).size < 2:
+            ax.text(0.5, 0.5, 'Insufficient class\nvariation', ha='center', va='center')
+            ax.set_title(label)
+            ax.set_axis_off()
+            continue
+        fpr, tpr, _ = roc_curve(yt, ys)
+        auc_val = roc_auc_score(yt, ys)
+        ax.plot(fpr, tpr, label=f'AUC={auc_val:.3f}')
+        ax.plot([0, 1], [0, 1], '--k', linewidth=1)
+        ax.set_xlabel('False Positive Rate')
+        ax.set_ylabel('True Positive Rate')
+        ax.set_title(label)
+        ax.legend(loc='lower right', fontsize=8)
+    for j in range(len(task_labels), len(axes)):
+        axes[j].set_axis_off()
+    plt.tight_layout()
+    print('saving',figure_loc)
+    fig.savefig(figure_loc, bbox_inches='tight')
+    plt.close(fig)
+
+
+def plot_pr_curves(model_path, dataset, fold, task_labels, y_true, y_score):
+    """Save per-label precision-recall curves for classification tasks."""
+    figure_loc = os.path.join(model_path, f'pr_curves_{fold}_{dataset}.pdf')
+    fig, axes = _make_subplot_grid(len(task_labels))
+    for i, label in enumerate(task_labels):
+        ax = axes[i]
+        yt = y_true[:, i]
+        ys = y_score[:, i]
+        mask = np.isfinite(yt) & np.isfinite(ys)
+        yt = yt[mask]
+        ys = ys[mask]
+        if yt.size == 0 or np.unique(yt).size < 2:
+            ax.text(0.5, 0.5, 'Insufficient class\nvariation', ha='center', va='center')
+            ax.set_title(label)
+            ax.set_axis_off()
+            continue
+        precision, recall, _ = precision_recall_curve(yt, ys)
+        ap_val = average_precision_score(yt, ys)
+        ax.plot(recall, precision, label=f'AP={ap_val:.3f}')
+        ax.set_xlabel('Recall')
+        ax.set_ylabel('Precision')
+        ax.set_title(label)
+        ax.legend(loc='lower left', fontsize=8)
+    for j in range(len(task_labels), len(axes)):
+        axes[j].set_axis_off()
+    plt.tight_layout()
+    print('saving',figure_loc)
+    fig.savefig(figure_loc, bbox_inches='tight')
+    plt.close(fig)
 
 def plot_training_progress(model_path, perf_log):
     """Save a training/validation loss plot.
