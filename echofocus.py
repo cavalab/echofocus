@@ -15,6 +15,13 @@ import h5py
 import torch
 import time
 from datetime import datetime
+import sys
+import torch.profiler
+import threading
+import subprocess
+import torch.multiprocessing as mp
+from collections import OrderedDict
+from sklearn.metrics import roc_auc_score, average_precision_score, median_absolute_error, r2_score
 
 # import cv2
 import numpy as np
@@ -45,7 +52,7 @@ class EchoFocus:
         seed=0,
         batch_number=128, # number of batches processed before updating
         batch_size=1,
-        epoch_lim=-1,
+        total_epochs=10,
         epoch_early_stop=9999,
         learning_rate=0.0001,  # default to 1e-4
         encoder_depth=0,
@@ -59,20 +66,39 @@ class EchoFocus:
         preload_embeddings=False,
         run_id=None,
         config='config.json',
-        cache_embeddings=False,
+        cache_video_tensors=False,
+        cache_panecho_embeddings=False,
         end_to_end=True,
         panecho_trainable=True,
+        transformer_trainable=True,
+        load_transformer_path=None,
+        load_panecho_path=None,
+        load_strict=False,
         num_clips=16,
         clip_len=16,
         use_hdf5_index=False,
-        video_base_path=None,
+        label_path=None,
+        embedding_path=None,
+        video_base_path="/lab-share/Cardio-Mayourian-e2/Public/Echo_Pulled",
         video_subdir_format="{echo_id}_trim",
+        max_videos_per_study=None,
+        max_video_cache_gb=250,
+        max_panecho_cache_gb=None,
         smoke_train=False,
-        smoke_num_samples=8,
         smoke_num_steps=2,
         debug_mem=False,
         amp=False,
         checkpoint_panecho=False,
+        profile=False,
+        profile_steps=20,
+        profile_dir="profiles",
+        timing_every=None,
+        profile_summary=False,
+        gpu_monitor=False,
+        gpu_monitor_interval=10,
+        ram_monitor=False,
+        ram_monitor_interval=10,
+        sharing_strategy="file_descriptor",
     ):
         """Initialize training/evaluation state and load config.
 
@@ -83,7 +109,7 @@ class EchoFocus:
             seed (int): RNG seed for reproducibility.
             batch_number (int): Gradient accumulation steps.
             batch_size (int): Batch size (only 1 supported).
-            epoch_lim (int): Max epochs to train; -1 for eval-only.
+            total_epochs (int): Max epochs to train; -1 for eval-only.
             epoch_early_stop (int): Early stopping patience in epochs.
             learning_rate (float): Optimizer learning rate.
             encoder_depth (int): Number of transformer encoder layers.
@@ -94,23 +120,39 @@ class EchoFocus:
             test_only (bool): If True, run evaluation only.
             parallel_processes (int): Number of dataloader workers.
             sample_limit (int): Limit number of samples.
-            preload_embeddings (bool): Deprecated preload mode.
             run_id (str|None): Optional run ID for reproducibility.
             config (str): Path to config JSON file.
-            cache_embeddings (bool): Cache embeddings in memory.
+            cache_video_tensors (bool): Cache raw video clips in memory (end-to-end only).
+            cache_panecho_embeddings (bool): Cache PanEcho embeddings (end-to-end frozen) or precomputed embeddings (non end-to-end).
             end_to_end (bool): If True, train end-to-end with PanEcho backbone.
             panecho_trainable (bool): If True, fine-tune the PanEcho backbone.
+            transformer_trainable (bool): If True, train the study-level transformer.
+            load_transformer_path (str|None): Optional path to load transformer weights.
+            load_panecho_path (str|None): Optional path to load PanEcho weights.
+            load_strict (bool): If True, enforce strict loading for submodules.
             num_clips (int): Number of clips sampled per video.
             clip_len (int): Frames per clip.
             use_hdf5_index (bool): Use embedding HDF5s to locate video paths.
             video_base_path (str): Base path for raw study folders.
             video_subdir_format (str): Format for study folder under base path.
+            max_videos_per_study (int|None): Optional cap on videos per study.
+            max_video_cache_gb (float|None): Optional RAM cache cap for video tensors.
+            max_panecho_cache_gb (float|None): Optional RAM cache cap for PanEcho embeddings.
             smoke_train (bool): If True, run a minimal smoke-training pass.
-            smoke_num_samples (int): Number of samples for smoke training.
             smoke_num_steps (int): Number of batches per epoch for smoke training.
             debug_mem (bool): If True, print CUDA memory stats for first batch each epoch.
             amp (bool): If True, use autocast + GradScaler mixed precision.
             checkpoint_panecho (bool): If True, checkpoint PanEcho forward to save memory.
+            profile (bool): If True, run PyTorch profiler for a short window.
+            profile_steps (int): Number of steps to profile.
+            profile_dir (str): Output directory for profiler traces.
+            timing_every (int): Print timing stats every N batches.
+            profile_summary (bool): If True, print a summary table after profiling.
+            gpu_monitor (bool): If True, log GPU utilization periodically.
+            gpu_monitor_interval (int): Seconds between GPU utilization logs.
+            ram_monitor (bool): If True, log process RAM usage periodically.
+            ram_monitor_interval (int): Seconds between RAM usage logs.
+            sharing_strategy (str): torch.multiprocessing sharing strategy ("file_descriptor" or "file_system").
         """
         self.time = time.time()
         self.datetime = str(datetime.now()).replace(" ", "_")
@@ -118,6 +160,47 @@ class EchoFocus:
             self.run_id = run_id
         else:
             self.run_id = f"{self.datetime}_{uuid.uuid4()}"
+
+        self.cache_video_tensors = cache_video_tensors
+        self.cache_panecho_embeddings = cache_panecho_embeddings
+        self.max_video_cache_gb = max_video_cache_gb
+        self.max_panecho_cache_gb = max_panecho_cache_gb
+        self._panecho_cache = OrderedDict()
+        self._panecho_cache_bytes = 0
+
+        if "TORCH_SHM_DIR" not in os.environ:
+            tmp_base = os.environ.get("TMPDIR") or os.environ.get("TMP") or os.environ.get("TEMP")
+            if tmp_base:
+                os.environ["TORCH_SHM_DIR"] = os.path.join(tmp_base, "torch-shm")
+
+        if self.sharing_strategy in ("file_descriptor", "file_system"):
+            mp.set_sharing_strategy(self.sharing_strategy)
+        else:
+            print(f"WARNING: unknown sharing_strategy={self.sharing_strategy}; using file_descriptor")
+            mp.set_sharing_strategy("file_descriptor")
+
+        try:
+            shm_stats = subprocess.check_output(["df", "-h", "/dev/shm"], text=True).strip().splitlines()
+            shm_line = shm_stats[-1] if shm_stats else ""
+        except Exception:
+            shm_line = "unavailable"
+        print(
+            "preflight:",
+            f"sharing_strategy={mp.get_sharing_strategy()}",
+            f"TORCH_SHM_DIR={os.environ.get('TORCH_SHM_DIR', '')}",
+            f"TMPDIR={os.environ.get('TMPDIR', '')}",
+            f"/dev/shm={shm_line}",
+        )
+        print(
+            "cache:",
+            f"video_tensors={self.cache_video_tensors}",
+            f"panecho_embeddings={self.cache_panecho_embeddings}",
+            f"max_video_cache_gb={self.max_video_cache_gb}",
+            f"max_panecho_cache_gb={self.max_panecho_cache_gb}",
+            f"num_clips={self.num_clips}",
+            f"clip_len={self.clip_len}",
+            f"max_videos_per_study={self.max_videos_per_study}",
+        )
 
         assert batch_size==1, "only batch_size=1 currently supported"
         print('main')
@@ -128,15 +211,24 @@ class EchoFocus:
         print("random seed", seed, "\n")
         print("batch_number", batch_number, "\n")
 
-        if epoch_lim == -1:
+        if total_epochs == -1:
             print("epoch lim missing. evaluating model")
-        print("epoch_lim", epoch_lim, "\n")
+        print("total_epochs", total_epochs, "\n")
 
         if epoch_early_stop == 9999:
             print("no early stop. defaulting to 10k epochs")
         print("epoch_early_stop", epoch_early_stop, "\n")
 
         print("learning_rate", learning_rate, "\n")
+
+        self._cli_overrides = set()
+        for arg in sys.argv[1:]:
+            if not arg.startswith("--"):
+                continue
+            key = arg[2:]
+            if "=" in key:
+                key = key.split("=", 1)[0]
+            self._cli_overrides.add(key)
 
 
         # 1. Check cuda
@@ -155,7 +247,8 @@ class EchoFocus:
         # 2. Set random seeds 
         np.random.seed(seed)
         torch.manual_seed(seed)
-        torch.backends.cudnn.deterministic = True # make TRUE if you want reproducible results (slower)     
+        torch.backends.cudnn.deterministic = False  # faster kernels, non-deterministic
+        torch.backends.cudnn.benchmark = True       # auto-tune cuDNN for fixed input sizes
          
         # set model name 
         if not model_name:
@@ -165,6 +258,142 @@ class EchoFocus:
 
         self._load_config()
         self._set_loss()
+
+    def _start_gpu_monitor(self):
+        if not self.gpu_monitor:
+            return None, None
+        stop_event = threading.Event()
+
+        def _worker():
+            while not stop_event.is_set():
+                try:
+                    out = subprocess.check_output(
+                        [
+                            "nvidia-smi",
+                            "--query-gpu=utilization.gpu,utilization.memory",
+                            "--format=csv,noheader,nounits",
+                        ],
+                        stderr=subprocess.DEVNULL,
+                        text=True,
+                    ).strip()
+                    if out:
+                        parts = [p.strip() for p in out.split(",")]
+                        if len(parts) >= 2:
+                            self._gpu_status = f"{parts[0]}%/{parts[1]}%"
+                        else:
+                            self._gpu_status = out
+                except Exception:
+                    pass
+                stop_event.wait(self.gpu_monitor_interval)
+
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+        return thread, stop_event
+
+    def _start_ram_monitor(self):
+        if not self.ram_monitor:
+            return None, None
+        stop_event = threading.Event()
+
+        def _read_rss_mb():
+            try:
+                import psutil
+                proc = psutil.Process(os.getpid())
+                return proc.memory_info().rss / (1024 ** 2)
+            except Exception:
+                try:
+                    with open(f"/proc/{os.getpid()}/statm", "r") as f:
+                        parts = f.read().strip().split()
+                    if len(parts) >= 2:
+                        rss_pages = int(parts[1])
+                        return rss_pages * (os.sysconf("SC_PAGE_SIZE") / (1024 ** 2))
+                except Exception:
+                    return None
+            return None
+
+        def _worker():
+            while not stop_event.is_set():
+                rss_mb = _read_rss_mb()
+                if rss_mb is not None:
+                    self._ram_status = f"{rss_mb/1024:.2f}GB"
+                stop_event.wait(self.ram_monitor_interval)
+
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+        return thread, stop_event
+
+    def _load_submodule_weights(self, module, path, prefix=None):
+        if path is None:
+            return
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        state = ckpt.get("model_state_dict", ckpt)
+        if prefix:
+            state = {k[len(prefix):]: v for k, v in state.items() if k.startswith(prefix)}
+        missing, unexpected = module.load_state_dict(state, strict=self.load_strict)
+        if missing or unexpected:
+            print(
+                f"WARNING: load from {path} missing={len(missing)} unexpected={len(unexpected)}"
+            )
+
+    def _panecho_cache_get(self, eid):
+        if eid in self._panecho_cache:
+            value = self._panecho_cache.pop(eid)
+            self._panecho_cache[eid] = value
+            return value
+        return None
+
+    def _panecho_cache_put(self, eid, value):
+        if not self.cache_panecho_embeddings:
+            return
+        if self.max_panecho_cache_gb is None:
+            self._panecho_cache[eid] = value
+            return
+        max_bytes = int(self.max_panecho_cache_gb * (1024 ** 3))
+        size = value.numel() * value.element_size()
+        if size > max_bytes:
+            return
+        while self._panecho_cache_bytes + size > max_bytes and len(self._panecho_cache) > 0:
+            _, evicted = self._panecho_cache.popitem(last=False)
+            self._panecho_cache_bytes -= evicted.numel() * evicted.element_size()
+        self._panecho_cache[eid] = value
+        self._panecho_cache_bytes += size
+
+    def _panecho_cache_clear(self):
+        self._panecho_cache.clear()
+        self._panecho_cache_bytes = 0
+
+    def _embedding_eids_from_path(self):
+        """Return echo IDs available under the embedding path."""
+        cache_index_path = os.path.join(self.embedding_path, "cache_index.json")
+        if os.path.isfile(cache_index_path):
+            with open(cache_index_path, "r") as f:
+                cache_index = json.load(f)
+            return [int(eid) for eid in cache_index.get("eids", [])]
+        return [int(k.split("_")[0]) for k in os.listdir(self.embedding_path)]
+
+    def _set_trainable_flags(self):
+        """Apply trainable flags to model submodules."""
+        if not hasattr(self, "model") or self.model is None:
+            return
+        if hasattr(self.model, "panecho"):
+            for param in self.model.panecho.parameters():
+                param.requires_grad = bool(self.panecho_trainable)
+        if hasattr(self.model, "transformer"):
+            for param in self.model.transformer.parameters():
+                param.requires_grad = bool(self.transformer_trainable)
+
+    def _get_last_epoch(self):
+        """Return last trained epoch from checkpoint, or 0 if missing."""
+        last_ckpt = os.path.join(self.model_path, "last_checkpoint.pt")
+        if not os.path.isfile(last_ckpt):
+            return 0
+        try:
+            ckpt = torch.load(last_ckpt, map_location="cpu")
+            if "perf_log" in ckpt and len(ckpt["perf_log"]) > 0:
+                return ckpt["perf_log"][-1][0]
+        except Exception:
+            pass
+        return 0
 
     def _load_config(self):
         """Load dataset/task config and set instance attributes.
@@ -181,10 +410,14 @@ class EchoFocus:
         if self.dataset not in data['dataset'].keys():
             raise ValueError(f'dataset must be one of: {list(data["dataset"].keys())}; got \"{self.dataset}\"')
         for k,v in data['task'][self.task].items():
+            if k in self._cli_overrides:
+                continue
             if hasattr(self, k) and getattr(self, k) != v:
                 print(f'WARNING: overriding init arg {k}={getattr(self, k)} with config value {v}')
             setattr(self,k,v)
         for k,v in data['dataset'][self.dataset].items():
+            if k in self._cli_overrides:
+                continue
             if hasattr(self, k) and getattr(self, k) != v:
                 print(f'WARNING: overriding init arg {k}={getattr(self, k)} with config value {v}')
             setattr(self,k,v)
@@ -213,14 +446,17 @@ class EchoFocus:
         """
         print('_setup_data...')
         print('label path:',self.label_path)
-        csv_data = pd.read_csv(self.label_path, nrows=self.sample_limit) # pull labels from local path
+        csv_data = pd.read_csv(self.label_path) # pull labels from local path
         print('loaded',len(csv_data),'labels from',self.label_path)
         print('dropping duplicates...')
         csv_data = csv_data.drop_duplicates() # I don't know why there are duplicates, but there are...
-        print('dropped duplicates')
+        print('dropped duplicates, new length:',len(csv_data))
+        # if self.sample_limit < len(csv_data):
+        #     print('sampling csv_data')
         if self.end_to_end and not self.use_hdf5_index:
             print('video_base_path:',self.video_base_path)
             candidate_eids = csv_data["eid"].astype(int).unique()
+            print('candidate_eids:',candidate_eids)
             Embedding_EchoID_List = [
                 eid
                 for eid in candidate_eids
@@ -233,9 +469,7 @@ class EchoFocus:
             ]
         else:
             print('embed path:',self.embedding_path)
-            Embedding_EchoID_List = [
-                int(k.split("_")[0]) for k in os.listdir(self.embedding_path)
-            ]
+            Embedding_EchoID_List = self._embedding_eids_from_path()
 
         print('Num echos in embedding folder:',len(Embedding_EchoID_List))
         # 3.2 limit label df rows to those
@@ -260,8 +494,8 @@ class EchoFocus:
                 eid_keep_list,
                 limit=self.sample_limit,
                 parallel_processes=self.parallel_processes,
-                # preload=self.preload_embeddings,
-                cache_embeddings=self.cache_embeddings,
+                cache_embeddings=self.cache_panecho_embeddings,
+                max_cache_gb=self.max_panecho_cache_gb,
                 batch_size=self.batch_size
             )
         # print('Total videos included: ',sum([study_embeddings[key].shape[0] for key in study_embeddings.keys()]))
@@ -321,11 +555,9 @@ class EchoFocus:
         print('Train_DF n=',len(Train_DF),', pids:',Train_DF.pid.nunique())
         print('Valid_DF n=',len(Valid_DF),', pids:',Valid_DF.pid.nunique())
         print('Test_DF n=',len(Test_DF),', pids:',Test_DF.pid.nunique())
-        # import ipdb                
-        # ipdb.set_trace()
-        # self._setup_model()
 
-        # 7. Get normalization parameters, normalize datasets
+
+        # Get normalization parameters, normalize datasets
         # if (('input_norm_dict' not in locals()) or (input_norm_dict is None)): # if didn't get or never had
         if self.task=='measure':
             if input_norm_dict is None:
@@ -341,12 +573,14 @@ class EchoFocus:
                 self.embedding_path,
                 Test_DF.index.values,
                 transforms=Test_Transforms,
-                cache_clips=self.cache_embeddings,
+                cache_clips=self.cache_video_tensors,
                 num_clips=self.num_clips,
                 clip_len=self.clip_len,
                 base_path=self.video_base_path,
                 use_hdf5_index=self.use_hdf5_index,
                 video_subdir_format=self.video_subdir_format,
+                max_videos_per_study=self.max_videos_per_study,
+                max_cache_gb=self.max_video_cache_gb,
             )
             test_dataset = CustomDataset(Test_DF, test_embeddings, self.task_labels)
         else:
@@ -359,7 +593,10 @@ class EchoFocus:
             batch_size=self.batch_size,
             shuffle=False,
             collate_fn=custom_collate,
-            # num_workers=self.parallel_processes
+            num_workers=self.parallel_processes,
+            pin_memory=True,
+            persistent_workers=False,
+            prefetch_factor=1 if self.parallel_processes else None,
         )
 
         if (Tr == 0):
@@ -372,13 +609,15 @@ class EchoFocus:
                     self.embedding_path,
                     Train_DF.index.values,
                     transforms=train_transform,
-                    cache_clips=self.cache_embeddings,
-                    num_clips=self.num_clips,
-                    clip_len=self.clip_len,
-                    base_path=self.video_base_path,
-                    use_hdf5_index=self.use_hdf5_index,
-                    video_subdir_format=self.video_subdir_format,
-                )
+                cache_clips=self.cache_video_tensors,
+                num_clips=self.num_clips,
+                clip_len=self.clip_len,
+                base_path=self.video_base_path,
+                use_hdf5_index=self.use_hdf5_index,
+                video_subdir_format=self.video_subdir_format,
+                max_videos_per_study=self.max_videos_per_study,
+                max_cache_gb=self.max_video_cache_gb,
+            )
                 train_dataset = CustomDataset(Train_DF, train_embeddings, self.task_labels)
             else:
                 train_dataset = CustomDataset(Train_DF, study_embeddings, self.task_labels)  # , study_filenames)
@@ -392,7 +631,10 @@ class EchoFocus:
                 # sampler=torch.utils.data.WeightedRandomSampler(
                 #     weights, len(weights), replacement=True
                 # ),
-                # num_workers=self.parallel_processes
+                num_workers=self.parallel_processes,
+                pin_memory=True,
+                persistent_workers=False,
+                prefetch_factor=1 if self.parallel_processes else None,
             )
             
             if self.end_to_end:
@@ -400,13 +642,15 @@ class EchoFocus:
                     self.embedding_path,
                     Valid_DF.index.values,
                     transforms=Test_Transforms,
-                    cache_clips=self.cache_embeddings,
-                    num_clips=self.num_clips,
-                    clip_len=self.clip_len,
-                    base_path=self.video_base_path,
-                    use_hdf5_index=self.use_hdf5_index,
-                    video_subdir_format=self.video_subdir_format,
-                )
+                cache_clips=self.cache_video_tensors,
+                num_clips=self.num_clips,
+                clip_len=self.clip_len,
+                base_path=self.video_base_path,
+                use_hdf5_index=self.use_hdf5_index,
+                video_subdir_format=self.video_subdir_format,
+                max_videos_per_study=self.max_videos_per_study,
+                max_cache_gb=self.max_video_cache_gb,
+            )
                 valid_dataset = CustomDataset(Valid_DF, valid_embeddings, self.task_labels)
             else:
                 valid_dataset = CustomDataset(Valid_DF, study_embeddings, self.task_labels) #, study_filenames)
@@ -418,11 +662,180 @@ class EchoFocus:
                 batch_size=self.batch_size,
                 shuffle=False,
                 collate_fn=custom_collate,
-                # num_workers=self.parallel_processes
+                num_workers=self.parallel_processes,
+                pin_memory=True,
+                persistent_workers=False,
+                prefetch_factor=1 if self.parallel_processes else None,
             )
         
 
         return train_dataloader, valid_dataloader, test_dataloader, input_norm_dict
+
+    def cache_embeddings(
+        self,
+        cache_root="embed/cache",
+        cache_tag=None,
+        num_shards=512,
+        compression="lzf",
+        dtype="float16",
+        use_train_transforms=False,
+        overwrite=False,
+        max_eids=None,
+        amp=False,
+        seed=None,
+    ):
+        """Cache PanEcho embeddings into sharded HDF5 files.
+
+        Args:
+            cache_root (str): Root directory for cached embeddings.
+            cache_tag (str|None): Optional cache directory name override.
+            num_shards (int): Number of HDF5 shard files to write.
+            compression (str|None): HDF5 compression ("lzf", "gzip", or None).
+            dtype (str): Numpy dtype for stored embeddings ("float16" or "float32").
+            use_train_transforms (bool): If True, use Train_Transforms.
+            overwrite (bool): If True, overwrite existing cached embeddings.
+            max_eids (int|None): Limit number of echo IDs to cache.
+            amp (bool): If True, use autocast for embedding generation.
+            seed (int|None): Optional RNG seed for deterministic clip sampling.
+        """
+        print("cache_embeddings: starting")
+        if seed is not None:
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+
+        print('label path:',self.label_path)
+        csv_data = pd.read_csv(self.label_path, nrows=self.sample_limit)
+        print('loaded',len(csv_data),'labels from',self.label_path)
+        print('dropping duplicates...')
+        csv_data = csv_data.drop_duplicates()
+        print('dropped duplicates')
+
+        if not self.use_hdf5_index:
+            print('video_base_path:',self.video_base_path)
+            candidate_eids = csv_data["eid"].astype(int).unique()
+            available_eids = [
+                eid
+                for eid in candidate_eids
+                if os.path.isdir(
+                    os.path.join(
+                        self.video_base_path,
+                        self.video_subdir_format.format(echo_id=int(eid)),
+                    )
+                )
+            ]
+        else:
+            print('embed path:',self.embedding_path)
+            available_eids = self._embedding_eids_from_path()
+
+        print('Num echos available:',len(available_eids))
+        tmp = csv_data.copy()
+        mask = tmp['eid'].isin(available_eids)
+        tmp = tmp[mask]
+        print('N echos after in_csv filter:',len(tmp))
+        tmp = tmp.loc[tmp[self.task_labels].dropna(how='all').index]
+        print('N Echos after excluding missing labels:',len(tmp))
+        eid_keep_list = tmp['eid'].astype(int).values
+        if max_eids is not None:
+            eid_keep_list = eid_keep_list[:max_eids]
+
+        from panecho import PanEchoBackbone
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        panecho = PanEchoBackbone(backbone_only=True, trainable=False).to(device)
+        panecho.eval()
+
+        def _hash_state_dict(state_dict):
+            import hashlib
+            h = hashlib.sha1()
+            for k in sorted(state_dict.keys()):
+                h.update(k.encode("utf-8"))
+                t = state_dict[k].detach().cpu().contiguous()
+                h.update(str(tuple(t.shape)).encode("utf-8"))
+                h.update(t.numpy().tobytes())
+            return h.hexdigest()
+
+        panecho_hash = _hash_state_dict(panecho.model.state_dict())
+        transform_name = "Train_Transforms" if use_train_transforms else "Test_Transforms"
+        cache_meta = {
+            "version": 1,
+            "panecho_hash": panecho_hash,
+            "num_clips": int(self.num_clips),
+            "clip_len": int(self.clip_len),
+            "transform": transform_name,
+            "num_shards": int(num_shards),
+            "shard_format": "shard_{shard:05d}.h5",
+            "dtype": dtype,
+            "compression": compression,
+            "video_subdir_format": self.video_subdir_format,
+            "use_hdf5_index": bool(self.use_hdf5_index),
+            "created_at": str(datetime.now()),
+            "eids": [int(eid) for eid in eid_keep_list],
+        }
+
+        import hashlib
+        cache_key_payload = json.dumps(
+            {
+                "panecho_hash": panecho_hash,
+                "num_clips": int(self.num_clips),
+                "clip_len": int(self.clip_len),
+                "transform": transform_name,
+                "version": 1,
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+        cache_key = hashlib.sha1(cache_key_payload).hexdigest()[:12]
+
+        cache_dir_name = cache_tag if cache_tag else cache_key
+        cache_dir = os.path.join(cache_root, cache_dir_name)
+        os.makedirs(cache_dir, exist_ok=True)
+        print(f"cache_dir: {cache_dir}")
+        cache_index_path = os.path.join(cache_dir, "cache_index.json")
+        if not os.path.isfile(cache_index_path) or overwrite:
+            with open(cache_index_path, "w") as f:
+                json.dump(cache_meta, f, indent=2)
+        else:
+            print("cache_index.json already exists; reusing it.")
+
+        transforms = Train_Transforms if use_train_transforms else Test_Transforms
+        video_ds = get_video_dataset(
+            self.embedding_path,
+            eid_keep_list,
+            transforms=transforms,
+            cache_clips=False,
+            num_clips=self.num_clips,
+            clip_len=self.clip_len,
+            base_path=self.video_base_path,
+            use_hdf5_index=self.use_hdf5_index,
+            video_subdir_format=self.video_subdir_format,
+        )
+
+        dtype_np = np.float16 if dtype == "float16" else np.float32
+        use_amp = amp and torch.cuda.is_available()
+        shard_map = {}
+        for eid in eid_keep_list:
+            shard_id = int(eid) % int(num_shards)
+            shard_map.setdefault(shard_id, []).append(int(eid))
+
+        for shard_id in sorted(shard_map.keys()):
+            shard_path = os.path.join(cache_dir, f"shard_{shard_id:05d}.h5")
+            with h5py.File(shard_path, "a") as f:
+                for eid in tqdm(shard_map[shard_id], desc=f"Shard {shard_id:05d}"):
+                    if str(eid) in f and not overwrite:
+                        if "emb" in f[str(eid)]:
+                            continue
+                    clips, _ = video_ds[eid]
+                    clips = clips.to(device)
+                    embeddings = []
+                    with torch.no_grad():
+                        for video_clips in clips:
+                            with torch.amp.autocast("cuda", enabled=use_amp):
+                                video_emb = panecho(video_clips)
+                            embeddings.append(video_emb.detach().cpu())
+                    emb = torch.stack(embeddings, dim=0).numpy().astype(dtype_np)
+                    grp = f.require_group(str(eid))
+                    if "emb" in grp:
+                        del grp["emb"]
+                    grp.create_dataset("emb", data=emb, compression=compression)
+        print("cache_embeddings: done")
 
     # def _normalize_data(self):
 
@@ -479,6 +892,7 @@ class EchoFocus:
                 clip_dropout=self.clip_dropout,
                 tf_combine="avg",
             )
+        self._set_trainable_flags()
         total_params = sum(p.numel() for p in self.model.parameters())
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         print(
@@ -494,7 +908,7 @@ class EchoFocus:
 
         
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr = self.learning_rate, weight_decay = 0.01)
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.amp)
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.amp)
         # add the scheduler
         patience = 3
         lr_factor = 0.5
@@ -523,6 +937,16 @@ class EchoFocus:
             best_epoch = 0
             best_loss = 1e10
 
+        # override submodule weights after any full checkpoint load
+        if self.end_to_end:
+            if self.load_panecho_path:
+                self._load_submodule_weights(self.model.panecho, self.load_panecho_path, prefix="panecho.")
+            if self.load_transformer_path:
+                self._load_submodule_weights(self.model.transformer, self.load_transformer_path, prefix="transformer.")
+        else:
+            if self.load_transformer_path:
+                self._load_submodule_weights(self.model, self.load_transformer_path, prefix="transformer.")
+
         # return model
         return self.model, current_epoch, best_epoch, best_loss, input_norm_dict
 
@@ -537,16 +961,16 @@ class EchoFocus:
         """
         smoke_steps = None
         if self.smoke_train:
-            if self.epoch_lim < 1:
-                self.epoch_lim = 1
+            if self.total_epochs < 1:
+                self.total_epochs = 1
             else:
-                self.epoch_lim = min(self.epoch_lim, 1)
+                self.total_epochs = min(self.total_epochs, 1)
             self.epoch_early_stop = 1
-            self.sample_limit = min(self.sample_limit, self.smoke_num_samples)
+            self.sample_limit = min(self.sample_limit, 5000)
             smoke_steps = self.smoke_num_steps
             print(
                 "smoke_train enabled:",
-                f"samples={self.sample_limit}, steps={smoke_steps}, epochs={self.epoch_lim}",
+                f"samples={self.sample_limit}, steps={smoke_steps}, epochs={self.total_epochs}",
             )
         model, current_epoch, best_epoch, best_loss, input_norm_dict = self._setup_model()
         train_dataloader, val_dataloader, test_dataloader, input_norm_dict = self._setup_data(
@@ -554,9 +978,61 @@ class EchoFocus:
             use_train_transforms=True,
         )
         
-        ########################################
-        # Training loop
+        self._run_training_loop(
+            model,
+            current_epoch,
+            best_epoch,
+            best_loss,
+            input_norm_dict,
+            train_dataloader,
+            val_dataloader,
+            test_dataloader,
+            smoke_steps=smoke_steps,
+        )
+
+    def _run_training_loop(
+        self,
+        model,
+        current_epoch,
+        best_epoch,
+        best_loss,
+        input_norm_dict,
+        train_dataloader,
+        val_dataloader,
+        test_dataloader,
+        smoke_steps=None,
+        epoch_hook=None,
+    ):
+        """Run the main training loop with an optional per-epoch hook."""
         print('begin training loop')
+        monitor_thread = None
+        monitor_stop = None
+        if self.gpu_monitor:
+            self._gpu_status = ""
+            monitor_thread, monitor_stop = self._start_gpu_monitor()
+        ram_thread = None
+        ram_stop = None
+        if self.ram_monitor:
+            self._ram_status = ""
+            ram_thread, ram_stop = self._start_ram_monitor()
+        prof = None
+        prof_records = []
+        profile_steps = int(self.profile_steps) if self.profile_steps is not None else 0
+        profile_steps = max(0, profile_steps)
+        if self.profile and profile_steps > 0:
+            os.makedirs(self.profile_dir, exist_ok=True)
+            prof = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ] if torch.cuda.is_available() else [torch.profiler.ProfilerActivity.CPU],
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=False,
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(self.profile_dir),
+            )
+            prof.start()
+
         def _mem(tag):
             if not torch.cuda.is_available():
                 return
@@ -566,21 +1042,41 @@ class EchoFocus:
             max_alloc = torch.cuda.max_memory_allocated() / 1024**3
             print(f"[mem] {tag}: alloc={alloc:.2f}G reserved={reserved:.2f}G max={max_alloc:.2f}G")
 
-        while (current_epoch < self.epoch_lim) and (
+        global_step = 0
+        prev_batch_end = None
+        while (current_epoch < self.total_epochs) and (
             current_epoch - best_epoch < self.epoch_early_stop
         ):
+            if epoch_hook is not None:
+                epoch_hook(current_epoch)
+                self._set_trainable_flags()
+                for pg in self.optimizer.param_groups:
+                    pg['lr'] = self.learning_rate
+            if self.panecho_trainable and len(self._panecho_cache) > 0:
+                print("clearing cached panecho embeddings (panecho_trainable=True)")
+                self._panecho_cache_clear()
+
             self.model.train()
             epoch_start_time = time.time()
-            # Train an epoch
             train_loss_total = 0
 
-            for batch_count, (Embedding, Correct_Out, EID) in tqdm(
-                enumerate(train_dataloader),
+            pbar = tqdm(
+                train_dataloader,
                 desc=f"Epoch {current_epoch}",
                 total=len(train_dataloader),
-            ):
-                #TODO: for quasi-batch for parallel workers in train data loader,
-                # add an extra loop to loop over batches                 
+            )
+            for batch_count, (Embedding, Correct_Out, EID) in enumerate(pbar):
+                postfix = []
+                if self.gpu_monitor and self._gpu_status:
+                    postfix.append(f"gpu={self._gpu_status}")
+                if self.ram_monitor and self._ram_status:
+                    postfix.append(f"ram={self._ram_status}")
+                if postfix:
+                    pbar.set_postfix_str(" ".join(postfix))
+                batch_start = time.time()
+                data_wait = None
+                if prev_batch_end is not None:
+                    data_wait = batch_start - prev_batch_end
 
                 if (torch.cuda.is_available()):
                     Embedding = Embedding.to('cuda')
@@ -588,54 +1084,117 @@ class EchoFocus:
                     
                 if self.debug_mem and batch_count == 0:
                     _mem("before forward")
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                t_fwd_start = time.time()
                 with torch.amp.autocast("cuda", enabled=self.amp):
-                    out = self.model(Embedding)
+                    if self.end_to_end and self.cache_panecho_embeddings and not self.panecho_trainable:
+                        eid_val = EID[0] if isinstance(EID, (list, tuple, np.ndarray)) else EID
+                        try:
+                            eid_key = int(eid_val)
+                        except Exception:
+                            eid_key = str(eid_val)
+                        cached = self._panecho_cache_get(eid_key)
+                        if cached is not None:
+                            emb = cached.to(Embedding.device)
+                        else:
+                            with torch.no_grad():
+                                emb = self.model._panecho_embed(Embedding)
+                            self._panecho_cache_put(eid_key, emb.detach().cpu())
+                        out = self.model.transformer(emb)
+                    else:
+                        out = self.model(Embedding)
                     train_loss = self.loss_fn(out, Correct_Out)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                t_fwd_end = time.time()
                 if self.debug_mem and batch_count == 0:
                     _mem("after forward")
                 if self.debug_mem and batch_count == 0:
                     _mem("after loss")
-                # train_loss = Loss_Func(out, Correct_lvef)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                t_bwd_start = time.time()
                 if self.amp:
                     self.scaler.scale(train_loss).backward()
                 else:
                     train_loss.backward()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                t_bwd_end = time.time()
                 if self.debug_mem and batch_count == 0:
                     _mem("after backward")
                 train_loss_total += train_loss.item()
                 
-                # Gradient accumulation
-                if ( (batch_count+1) % self.batch_number ==0) : # update after batch_number patients            
+                step_performed = False
+                if ( (batch_count+1) % self.batch_number ==0) :           
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    t_step_start = time.time()
                     if self.amp:
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
                     else:
                         self.optimizer.step()
                     self.model.zero_grad()
-                    # print('DEBUG: model updated', (batch_count+1), batch_number)
-                    
-                elif ( (batch_count+1) == len(train_dataloader) ): # or if on last set of videos
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    t_step_end = time.time()
+                    step_performed = True
+                elif ( (batch_count+1) == len(train_dataloader) ):
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    t_step_start = time.time()
                     if self.amp:
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
                     else:
                         self.optimizer.step()
                     self.model.zero_grad()
-                    # print('DEBUG: model updated at end of epoch without reaching batch_num', (batch_count+1), len(train_dataloader))
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    t_step_end = time.time()
+                    step_performed = True
 
                 if smoke_steps is not None and (batch_count + 1) >= smoke_steps:
                     if (batch_count + 1) % self.batch_number != 0:
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                        t_step_start = time.time()
                         if self.amp:
                             self.scaler.step(self.optimizer)
                             self.scaler.update()
                         else:
                             self.optimizer.step()
                         self.model.zero_grad()
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                        t_step_end = time.time()
+                        step_performed = True
                     break
+                
+                if prof is not None and global_step < profile_steps:
+                    prof.step()
+                if prof is not None and global_step == profile_steps:
+                    if self.profile_summary:
+                        prof_records.append(prof)
+                    prof.stop()
+                    prof = None
+                
+                if self.timing_every and (batch_count + 1) % int(self.timing_every) == 0:
+                    step_time = (t_step_end - t_step_start) if step_performed else 0.0
+                    total_time = time.time() - batch_start
+                    data_wait_s = data_wait if data_wait is not None else 0.0
+                    print(
+                        f"[timing] batch={batch_count+1} data_wait={data_wait_s:.2f}s "
+                        f"fwd={t_fwd_end - t_fwd_start:.2f}s bwd={t_bwd_end - t_bwd_start:.2f}s "
+                        f"step={step_time:.2f}s total={total_time:.2f}s"
+                    )
+                prev_batch_end = time.time()
+                global_step += 1
                     
             epoch_end_time = time.time()
             
-            # Get loss on validation dataset
             __, __, __, val_loss_total = run_model_on_dataloader(
                 self.model,
                 val_dataloader,
@@ -643,7 +1202,6 @@ class EchoFocus:
                 amp=self.amp,
             )
             
-            # update trained epoch count and log performance
             current_epoch = current_epoch + 1
             
             tmp_LR = self.optimizer.state_dict()['param_groups'][0]['lr']
@@ -655,12 +1213,9 @@ class EchoFocus:
                     'epoch time':epoch_end_time - epoch_start_time,
             }
             self.perf_log.append(list(perf.values()))
-            # print(self.perf_log[-1])
             print(' '.join([f'{k}: {v}' for k,v in perf.items() if k in ['train loss','val loss','lr']]))
             self.save_log()
             
-
-            # update scheduler
             self.scheduler.step(val_loss_total)
             save_nn(
                 self.model,
@@ -671,7 +1226,6 @@ class EchoFocus:
                 input_norm_dict=input_norm_dict,
             )
                 
-            # if validation loss better than previous checkpoint, save as best
             if (val_loss_total < best_loss):
                 save_nn(
                     self.model,
@@ -684,13 +1238,38 @@ class EchoFocus:
                 best_loss = val_loss_total 
                 best_epoch = current_epoch
 
-            
-            if (current_epoch == self.epoch_lim): 
+            if (current_epoch == self.total_epochs): 
                 print('current epoch = epoch limit, terminating')
             if current_epoch - best_epoch == self.epoch_early_stop:
                 print('early stopping')
+
             
-        # Save training progress figure
+        if prof is not None:
+            if self.profile_summary:
+                prof_records.append(prof)
+            prof.stop()
+            prof = None
+
+        if self.profile_summary and prof_records:
+            try:
+                summary = prof_records[-1].key_averages().table(
+                    sort_by="cuda_time_total" if torch.cuda.is_available() else "cpu_time_total",
+                    row_limit=50,
+                )
+                print("Profiler summary (top ops):")
+                print(summary)
+            except Exception as e:
+                print(f"warning: failed to print profiler summary: {e}")
+
+        if monitor_stop is not None:
+            monitor_stop.set()
+        if monitor_thread is not None:
+            monitor_thread.join(timeout=1.0)
+        if ram_stop is not None:
+            ram_stop.set()
+        if ram_thread is not None:
+            ram_thread.join(timeout=1.0)
+
         utils.plot_training_progress( self.model_path, self.perf_log)
         print('Training Completed')
         
@@ -699,6 +1278,82 @@ class EchoFocus:
         for dataloader,fold in zip((train_dataloader,val_dataloader,test_dataloader),('train','val','test')):
             self._evaluate(best_model, dataloader, fold, input_norm_dict)
 
+    @utils.initializer
+    def train_ping_pong(
+        self,
+        total_epochs=10,
+        start_with="transformer",
+        switch_every=1,
+        transformer_lr=None,
+        panecho_lr=None,
+        split=(64,16,20),
+    ):
+        """Alternate training between transformer-only and PanEcho-only phases.
+
+        Args:
+            total_epochs (int): Total epochs to train to.
+            start_with (str): "transformer" or "panecho".
+            switch_every (int): Number of epochs per phase.
+            transformer_lr (float|None): Optional LR for transformer-only phases.
+            panecho_lr (float|None): Optional LR for panecho-only phases.
+            split (tuple[int,int,int]): Train/val/test split.
+        """
+        if start_with not in ("transformer", "panecho"):
+            raise ValueError("start_with must be 'transformer' or 'panecho'")
+        smoke_steps = None
+        if self.smoke_train:
+            if total_epochs < 1:
+                total_epochs = 1
+            self.epoch_early_stop = 1
+            self.sample_limit = min(self.sample_limit, 5000)
+            smoke_steps = self.smoke_num_steps
+            print(
+                "smoke_train enabled:",
+                f"samples={self.sample_limit}, steps={smoke_steps}, epochs={total_epochs}",
+            )
+
+        self.total_epochs = int(total_epochs)
+        model, current_epoch, best_epoch, best_loss, input_norm_dict = self._setup_model()
+        train_dataloader, val_dataloader, test_dataloader, input_norm_dict = self._setup_data(
+            input_norm_dict,
+            use_train_transforms=True,
+        )
+
+        orig_lr = self.learning_rate
+        switch_every = max(1, int(switch_every))
+        start_phase_idx = 0 if start_with == "transformer" else 1
+
+        def _epoch_hook(epoch):
+            phase_idx = ((epoch // switch_every) + start_phase_idx) % 2
+            if phase_idx == 0:
+                print(f"phase: transformer-only epoch {epoch}")
+                self.panecho_trainable = False
+                self.transformer_trainable = True
+                if transformer_lr is not None:
+                    self.learning_rate = transformer_lr
+                else:
+                    self.learning_rate = orig_lr
+            else:
+                print(f"phase: panecho-only epoch {epoch}")
+                self.panecho_trainable = True
+                self.transformer_trainable = False
+                if panecho_lr is not None:
+                    self.learning_rate = panecho_lr
+                else:
+                    self.learning_rate = orig_lr
+
+        self._run_training_loop(
+            model,
+            current_epoch,
+            best_epoch,
+            best_loss,
+            input_norm_dict,
+            train_dataloader,
+            val_dataloader,
+            test_dataloader,
+            smoke_steps=smoke_steps,
+            epoch_hook=_epoch_hook,
+        )
     def _evaluate(self, model, dataloader, fold, input_norm_dict=None):
         """Evaluate a model on a dataloader and write outputs.
 
@@ -713,11 +1368,28 @@ class EchoFocus:
             return
         # Run on test dataset
         print(f'run model on {fold} set')
+        def _cache_hook(embedding, eid):
+            if self.end_to_end and self.cache_panecho_embeddings and not self.panecho_trainable:
+                eid_val = eid[0] if isinstance(eid, (list, tuple, np.ndarray)) else eid
+                try:
+                    eid_key = int(eid_val)
+                except Exception:
+                    eid_key = str(eid_val)
+                cached = self._panecho_cache_get(eid_key)
+                if cached is not None:
+                    emb = cached.to(embedding.device)
+                else:
+                    emb = model._panecho_embed(embedding)
+                    self._panecho_cache_put(eid_key, emb.detach().cpu())
+                return model.transformer(emb)
+            return model(embedding)
+
         y_true, y_pred, EIDs, loss = run_model_on_dataloader(
             model,
             dataloader,
             self.loss_fn,
             amp=self.amp,
+            cache_hook=_cache_hook,
         )
         # convert model outputs back
         y_true = np.array(y_true).squeeze()
@@ -745,6 +1417,166 @@ class EchoFocus:
 
         if self.task == 'measure': 
             utils.scatter_plots(self.model_path, self.dataset, fold, self.task_labels, y_true, y_pred)
+
+    def _bootstrap_metric_ci(
+        self,
+        y_true,
+        y_pred,
+        metric_fn,
+        rng,
+        n_bootstrap=1000,
+        ci_percentiles=(2.5, 97.5),
+        require_two_classes=False,
+    ):
+        """Compute metric value and bootstrap confidence interval."""
+        if y_true.size == 0:
+            return None, None, None, 0
+        if require_two_classes and np.unique(y_true).size < 2:
+            return None, None, None, 0
+
+        try:
+            metric_value = float(metric_fn(y_true, y_pred))
+        except ValueError:
+            metric_value = None
+
+        bootstrap_values = []
+        n = y_true.shape[0]
+        for _ in range(int(n_bootstrap)):
+            idx = rng.integers(0, n, size=n)
+            yb_true = y_true[idx]
+            yb_pred = y_pred[idx]
+            if require_two_classes and np.unique(yb_true).size < 2:
+                continue
+            try:
+                val = metric_fn(yb_true, yb_pred)
+            except ValueError:
+                continue
+            if np.isfinite(val):
+                bootstrap_values.append(float(val))
+
+        if len(bootstrap_values) == 0:
+            return metric_value, None, None, 0
+
+        low, high = np.percentile(np.array(bootstrap_values), list(ci_percentiles))
+        return metric_value, float(low), float(high), len(bootstrap_values)
+
+    def get_metrics(self, fold='test', dataset=None, n_bootstrap=1000, model_name=None):
+        """Compute task metrics from saved predictions and write JSON output."""
+        if model_name is not None:
+            self.model_name = model_name
+            self.model_path = os.path.join('./trained_models', model_name)
+
+        if dataset is None:
+            dataset = self.dataset
+        saveout_path = os.path.join(self.model_path, f'saveout_{fold}_{dataset}.csv')
+        if not os.path.exists(saveout_path):
+            print(f'WARNING: saveout file not found, skipping metrics: {saveout_path}')
+            return None
+
+        df = pd.read_csv(saveout_path)
+        rng = np.random.default_rng(self.seed)
+        out = {
+            'task': self.task,
+            'dataset': dataset,
+            'fold': fold,
+            'n_bootstrap': int(n_bootstrap),
+            'metrics': {},
+        }
+
+        y_true_all = []
+        y_pred_all = []
+        valid_labels = []
+
+        for label in self.task_labels:
+            true_col = f'{label}_Correct'
+            pred_col = f'{label}_Predict'
+            if true_col not in df.columns or pred_col not in df.columns:
+                print(f'WARNING: missing columns for label {label}, skipping')
+                continue
+
+            y_true = pd.to_numeric(df[true_col], errors='coerce').to_numpy(dtype=float)
+            y_pred = pd.to_numeric(df[pred_col], errors='coerce').to_numpy(dtype=float)
+            mask = np.isfinite(y_true) & np.isfinite(y_pred)
+            y_true = y_true[mask]
+            y_pred = y_pred[mask]
+
+            label_metrics = {'n_samples': int(y_true.shape[0])}
+            if self.task in ['chd', 'fyler']:
+                roc_val, roc_lo, roc_hi, roc_eff_n = self._bootstrap_metric_ci(
+                    y_true,
+                    y_pred,
+                    roc_auc_score,
+                    rng=rng,
+                    n_bootstrap=n_bootstrap,
+                    require_two_classes=True,
+                )
+                ap_val, ap_lo, ap_hi, ap_eff_n = self._bootstrap_metric_ci(
+                    y_true,
+                    y_pred,
+                    average_precision_score,
+                    rng=rng,
+                    n_bootstrap=n_bootstrap,
+                    require_two_classes=True,
+                )
+                label_metrics['roc_auc_score'] = {
+                    'value': roc_val,
+                    'ci_lower': roc_lo,
+                    'ci_upper': roc_hi,
+                    'n_bootstrap_effective': roc_eff_n,
+                }
+                label_metrics['average_precision'] = {
+                    'value': ap_val,
+                    'ci_lower': ap_lo,
+                    'ci_upper': ap_hi,
+                    'n_bootstrap_effective': ap_eff_n,
+                }
+                y_true_all.append(y_true)
+                y_pred_all.append(y_pred)
+                valid_labels.append(label)
+            elif self.task == 'measure':
+                mae_val, mae_lo, mae_hi, mae_eff_n = self._bootstrap_metric_ci(
+                    y_true,
+                    y_pred,
+                    median_absolute_error,
+                    rng=rng,
+                    n_bootstrap=n_bootstrap,
+                )
+                r2_val, r2_lo, r2_hi, r2_eff_n = self._bootstrap_metric_ci(
+                    y_true,
+                    y_pred,
+                    r2_score,
+                    rng=rng,
+                    n_bootstrap=n_bootstrap,
+                )
+                label_metrics['median_absolute_error'] = {
+                    'value': mae_val,
+                    'ci_lower': mae_lo,
+                    'ci_upper': mae_hi,
+                    'n_bootstrap_effective': mae_eff_n,
+                }
+                label_metrics['r2_score'] = {
+                    'value': r2_val,
+                    'ci_lower': r2_lo,
+                    'ci_upper': r2_hi,
+                    'n_bootstrap_effective': r2_eff_n,
+                }
+            out['metrics'][label] = label_metrics
+
+        metrics_path = os.path.join(self.model_path, f'metrics_{fold}_{dataset}.json')
+        with open(metrics_path, 'w') as f:
+            json.dump(out, f, indent=2)
+        print('writing', metrics_path)
+
+        if self.task in ['chd', 'fyler'] and len(valid_labels) > 0:
+            max_n = max(arr.shape[0] for arr in y_true_all)
+            y_true_mat = np.full((max_n, len(valid_labels)), np.nan)
+            y_pred_mat = np.full((max_n, len(valid_labels)), np.nan)
+            for i, (yt, yp) in enumerate(zip(y_true_all, y_pred_all)):
+                y_true_mat[: yt.shape[0], i] = yt
+                y_pred_mat[: yp.shape[0], i] = yp
+            utils.plot_roc_curves(self.model_path, dataset, fold, valid_labels, y_true_mat, y_pred_mat)
+            utils.plot_pr_curves(self.model_path, dataset, fold, valid_labels, y_true_mat, y_pred_mat)
+        return out
         
             
     def evaluate(self):
@@ -763,8 +1595,9 @@ class EchoFocus:
             use_train_transforms=False,
         )
 
-        for fold,dataloader in zip((train_dl,val_dl,test_dl),('train','val','test')):
-            self._evaluate(model, dataloader, fold, input_norm_dict)
+        for dataloader, fold in zip((train_dl, val_dl, test_dl), ('train', 'val', 'test')):
+            self._evaluate(best_model, dataloader, fold, input_norm_dict)
+            self.get_metrics(fold=fold, dataset=self.dataset)
             print('eval time taken: ', time.time() - eval_start_time)
 
     def _set_loss(self):
@@ -1076,87 +1909,8 @@ def load_model_and_random_state(path, model, optimizer=None, scheduler=None):
     
     return model, optimizer, scheduler, perf_log, input_norm_dict
 
-# # WGL: draft of a batch version of this function
-# def run_model_on_dataloader(
-#     model: torch.nn.Module,
-#     dataloader: torch.utils.data.DataLoader,
-#     loss_func: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
-#     *,
-#     device: Optional[Union[str, torch.device]] = None,
-# ) -> Tuple[torch.Tensor, torch.Tensor, List[int], float]:
-#     """
-#     Assumes Dataset.__getitem__ returns:
-#         embedding, label, eid   (eid is an int)
 
-#     Returns:
-#         preds: (N, ...) CPU tensor
-#         labels: (N, ...) CPU tensor
-#         eids: List[int] length N
-#         mean_loss: float (per-sample)
-#     """
-#     model.eval()
-
-#     if device is None:
-#         try:
-#             device = next(model.parameters()).device
-#         except StopIteration:
-#             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-#     else:
-#         device = torch.device(device)
-
-#     preds: List[torch.Tensor] = []
-#     labels: List[torch.Tensor] = []
-#     eids_all: List[int] = []
-
-#     total_loss = 0.0
-#     total_n = 0
-
-#     pbar = tqdm(dataloader, total=len(dataloader.dataset), unit="samples")
-
-#     with torch.inference_mode():
-#         for embedding, label, eid in pbar:
-#             # embedding: (B, ...)
-#             # label:     (B, ...)
-#             # eid:       tensor shape (B,) or scalar
-#             # print('embedding shape:',embedding.shape)
-#             embedding = embedding.to(device, non_blocking=True)
-#             label = label.to(device, non_blocking=True)
-
-#             outputs = model(embedding)
-
-#             loss_t = loss_func(outputs, label)
-#             B = embedding.shape[0]
-#             total_n += B
-
-#             # Correct averaging regardless of loss reduction
-#             if loss_t.ndim == 0:
-#                 total_loss += float(loss_t) * B
-#                 loss_display = float(loss_t)
-#             else:
-#                 total_loss += float(loss_t.sum())
-#                 loss_display = float(loss_t.mean())
-
-#             preds.append(outputs.cpu())
-#             labels.append(label.cpu())
-
-#             # ---- EID handling ----
-#             if torch.is_tensor(eid):
-#                 eids_all.extend(int(v) for v in eid.cpu().tolist())
-#             else:
-#                 # batch_size == 1 fallback
-#                 eids_all.append(int(eid))
-
-#             # pbar.set_postfix(loss=loss_display)
-#             # pbar.update(B)
-#     # pbar.close()
-
-#     preds = torch.cat(preds, dim=0)
-#     labels = torch.cat(labels, dim=0)
-#     mean_loss = total_loss / total_n
-
-#     return preds, labels, eids_all, mean_loss
-
-def run_model_on_dataloader(model, dataloader, loss_func_pointer, amp=False):
+def run_model_on_dataloader(model, dataloader, loss_func_pointer, amp=False, cache_hook=None):
     """Run inference on a dataloader and collect outputs.
 
     Args:
@@ -1181,10 +1935,12 @@ def run_model_on_dataloader(model, dataloader, loss_func_pointer, amp=False):
             embedding = embedding.to("cuda")
             correct_labels = correct_labels.to("cuda")
 
-
         with torch.no_grad():
             with torch.amp.autocast("cuda", enabled=use_amp):
-                model_outputs = model(embedding)
+                if cache_hook is not None:
+                    model_outputs = cache_hook(embedding, eid)
+                else:
+                    model_outputs = model(embedding)
             return_model_outputs.append(model_outputs.to('cpu'))
             return_correct_outputs.append(correct_labels.to('cpu'))
             return_EIDs.append(eid)

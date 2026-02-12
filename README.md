@@ -84,6 +84,13 @@ Would generate study embeddings using the EchoFocus_Measure model on the "outsid
 EchoFocus supports model explanations that attribute importance to individual videos in the echo study using integrated gradients. 
 This is accomplished by calling `python echofocus.py explain` with the appropriate arguments. 
 
+# Cite
+
+
+Platon Lukyanenko, Sunil Ghelani, Yuting Yang, Bohan Jiang, Timothy Miller, David Harrild, Nao Sasaki, Francesca Sperotto, Danielle Sganga, John Triedman, Andrew J. Powell, Tal Geva, William G. La Cava, Joshua Mayourian (2026).
+**Automated Echocardiographic Detection of Congenital Heart Disease Using Artificial Intelligence**.
+Preprint: [medrxiv.org](https://www.medrxiv.org/content/10.64898/2026.01.24.26344771v1)
+
 
 # Contact
 
