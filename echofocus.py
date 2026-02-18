@@ -1277,6 +1277,7 @@ class EchoFocus:
         best_model,_,_,_,input_norm_dict  = load_model_and_random_state(best_checkpoint_path, model)
         for dataloader,fold in zip((train_dataloader,val_dataloader,test_dataloader),('train','val','test')):
             self._evaluate(best_model, dataloader, fold, input_norm_dict)
+            self.get_metrics(fold=fold)
 
     @utils.initializer
     def train_ping_pong(
