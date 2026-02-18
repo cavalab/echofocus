@@ -1710,9 +1710,6 @@ class EchoFocus:
             y_trues = y_true_test[:,task_idx]
             y_trues_norm = y_true_test_norm[:,task_idx]
             y_preds = y_pred_test[:,task_idx]
-            if self.task != 'measure':
-                # apply sigmoid to logits for classifier outputs
-                y_preds = [utils.sigmoid(yp) for yp in y_preds]
             if self.task == 'measure':
                 quantiles = [0.]+[
                     np.nanquantile(y_trues,i) for i in [.2, .4, .6, .8, 1.]
@@ -1936,6 +1933,7 @@ def run_model_on_dataloader(model, dataloader, loss_func_pointer, amp=False, cac
     return_correct_outputs = []
     return_EIDs = []
     loss = 0
+    is_classification = isinstance(loss_func_pointer, torch.nn.BCEWithLogitsLoss)
     pbar = tqdm(dataloader, total=len(dataloader.dataset), desc="Inference")
     use_amp = amp and torch.cuda.is_available()
     for embedding, correct_labels, eid in pbar:
@@ -1949,7 +1947,8 @@ def run_model_on_dataloader(model, dataloader, loss_func_pointer, amp=False, cac
                     model_outputs = cache_hook(embedding, eid)
                 else:
                     model_outputs = model(embedding)
-            return_model_outputs.append(model_outputs.to('cpu'))
+            outputs_to_return = torch.sigmoid(model_outputs) if is_classification else model_outputs
+            return_model_outputs.append(outputs_to_return.to('cpu'))
             return_correct_outputs.append(correct_labels.to('cpu'))
             return_EIDs.append(eid)
             loss += float(loss_func_pointer(model_outputs, correct_labels).to("cpu"))
