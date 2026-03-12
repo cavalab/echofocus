@@ -1004,7 +1004,6 @@ class EchoFocus:
         epoch_hook=None,
     ):
         """Run the main training loop with an optional per-epoch hook."""
-        print('begin training loop')
         monitor_thread = None
         monitor_stop = None
         if self.gpu_monitor:
@@ -1047,6 +1046,7 @@ class EchoFocus:
         while (current_epoch < self.total_epochs) and (
             current_epoch - best_epoch < self.epoch_early_stop
         ):
+            print('beginning training loop')
             if epoch_hook is not None:
                 epoch_hook(current_epoch)
                 self._set_trainable_flags()
