@@ -1,9 +1,14 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "echo-focus"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.9"
+scripts = { echofocus = "echofocus.cli:main" }
 dependencies = [
     "fire>=0.7.1",
     "h5py>=3.14.0",
@@ -23,3 +28,9 @@ dependencies = [
     "torchvision>=0.23.0",
     "tqdm>=4.67.1",
 ]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
