@@ -11,6 +11,7 @@ import os
 import json
 import csv
 import h5py
+import ast
 
 import torch
 import time
@@ -66,6 +67,7 @@ class EchoFocus:
         preload_embeddings=False,
         run_id=None,
         config='config.json',
+        split=(64,16,20),
         cache_video_tensors=False,
         cache_panecho_embeddings=False,
         end_to_end=True,
@@ -122,6 +124,7 @@ class EchoFocus:
             sample_limit (int): Limit number of samples.
             run_id (str|None): Optional run ID for reproducibility.
             config (str): Path to config JSON file.
+            split (tuple[int, int, int]): Default train/val/test PID split.
             cache_video_tensors (bool): Cache raw video clips in memory (end-to-end only).
             cache_panecho_embeddings (bool): Cache PanEcho embeddings (end-to-end frozen) or precomputed embeddings (non end-to-end).
             end_to_end (bool): If True, train end-to-end with PanEcho backbone.
@@ -328,12 +331,133 @@ class EchoFocus:
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
         state = ckpt.get("model_state_dict", ckpt)
         if prefix:
-            state = {k[len(prefix):]: v for k, v in state.items() if k.startswith(prefix)}
+            prefixed_state = {k[len(prefix):]: v for k, v in state.items() if k.startswith(prefix)}
+            if prefixed_state:
+                state = prefixed_state
         missing, unexpected = module.load_state_dict(state, strict=self.load_strict)
         if missing or unexpected:
             print(
                 f"WARNING: load from {path} missing={len(missing)} unexpected={len(unexpected)}"
             )
+
+    def _can_bootstrap_inference_checkpoint(self):
+        """Return True when direct weight paths are sufficient to build a checkpoint."""
+        return bool(self.load_transformer_path) or bool(self.load_panecho_path)
+
+    def _get_checkpoint_metadata(self, path):
+        """Read optional metadata from a checkpoint-like file."""
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        perf_log = ckpt.get("perf_log")
+        input_norm_dict = ckpt.get("input_norm_dict")
+        return perf_log, input_norm_dict
+
+    def _apply_training_args_from_csv(self, train_args_path):
+        """Apply key architecture settings from a saved training-args CSV."""
+        if not os.path.isfile(train_args_path):
+            return False
+
+        train_args = pd.read_csv(train_args_path).to_dict(orient='records')[0]
+        converters = {
+            'encoder_depth': int,
+            'clip_dropout': float,
+        }
+        direct_keys = ['encoder_depth', 'task_labels', 'clip_dropout']
+        legacy_key_map = {
+            'target_label_list': 'task_labels',
+        }
+        applied = False
+        for source_key in direct_keys:
+            if source_key not in train_args:
+                continue
+            target_key = source_key
+            value = train_args[source_key]
+            if target_key in converters and pd.notna(value):
+                value = converters[target_key](value)
+            if target_key in self._cli_overrides:
+                continue
+            if getattr(self, target_key, None) != value:
+                print(f'WARNING: using {target_key}={value}, loaded from {train_args_path}')
+                setattr(self, target_key, value)
+                applied = True
+
+        for source_key, target_key in legacy_key_map.items():
+            if source_key not in train_args or target_key in self._cli_overrides:
+                continue
+            value = train_args[source_key]
+            if target_key == 'task_labels' and isinstance(value, str):
+                value = ast.literal_eval(value)
+            if getattr(self, target_key, None) != value:
+                print(f'WARNING: using {target_key}={value}, loaded from {train_args_path}')
+                setattr(self, target_key, value)
+                applied = True
+        return applied
+
+    def _maybe_apply_source_train_args(self):
+        """Load train args from the target run directory or source checkpoints."""
+        train_args_path = os.path.join(self.model_path, 'train_args.csv')
+        if self._apply_training_args_from_csv(train_args_path):
+            return
+
+        source_paths = [self.load_transformer_path, self.load_panecho_path]
+        seen = set()
+        for source_path in source_paths:
+            if not source_path:
+                continue
+            candidate = os.path.join(os.path.dirname(os.path.abspath(source_path)), 'train_args.csv')
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            if self._apply_training_args_from_csv(candidate):
+                return
+
+    def _bootstrap_inference_checkpoint(self, model, input_norm_dict=None):
+        """Persist a synthetic best checkpoint from directly loaded weights."""
+        if not self._can_bootstrap_inference_checkpoint():
+            raise FileNotFoundError(
+                f"No checkpoint found at {self.best_checkpoint_path}. "
+                "Provide an existing model_name checkpoint or direct weight files."
+            )
+
+        metadata_paths = [self.load_transformer_path, self.load_panecho_path]
+        perf_log = None
+        for path in metadata_paths:
+            if not path or not os.path.isfile(path):
+                continue
+            candidate_perf_log, candidate_input_norm = self._get_checkpoint_metadata(path)
+            if perf_log is None and candidate_perf_log:
+                perf_log = candidate_perf_log
+            if input_norm_dict is None and candidate_input_norm is not None:
+                input_norm_dict = candidate_input_norm
+
+        if perf_log is None:
+            perf_log = [[0, float("nan"), float("nan"), float(self.learning_rate), 0.0]]
+
+        save_nn(
+            model,
+            self.best_checkpoint_path,
+            perf_log,
+            optimizer=None,
+            scheduler=None,
+            input_norm_dict=input_norm_dict,
+        )
+        print(f"bootstrapped inference checkpoint at {self.best_checkpoint_path}")
+        return input_norm_dict
+
+    def _load_inference_model(self):
+        """Return an inference-ready model and normalization metadata."""
+        model, _, _, _, input_norm_dict = self._setup_model()
+        if os.path.isfile(self.best_checkpoint_path):
+            best_model, _, _, _, input_norm_dict = load_model_and_random_state(
+                self.best_checkpoint_path,
+                model,
+            )
+            return best_model, input_norm_dict
+
+        input_norm_dict = self._bootstrap_inference_checkpoint(
+            model,
+            input_norm_dict=input_norm_dict,
+        )
+        return model, input_norm_dict
 
     def _panecho_cache_get(self, eid):
         if eid in self._panecho_cache:
@@ -862,13 +986,7 @@ class EchoFocus:
         # if there is a trained model we are loading, make sure the training
         # arguments related to CustomTransformer match what was used. 
         # if they don't, override them and warn the user.
-        train_args_path = os.path.join(self.model_path,'train_args.csv')
-        if os.path.exists(train_args_path):
-            train_args = pd.read_csv(train_args_path).to_dict(orient='records')[0]
-            for k in ['encoder_depth','task_labels','clip_dropout']:
-                if k in train_args and train_args[k] != getattr(self,k):
-                    print(f'WARNING: using {k}={train_args[k]}, loaded from {train_args_path}')
-                    setattr(self,k,train_args[k])
+        self._maybe_apply_source_train_args()
 
         # 6. Pull model if it already exists
         if self.end_to_end:
@@ -953,11 +1071,8 @@ class EchoFocus:
     # def load_checkpoint(self, checkpoint):
 
     @utils.initializer
-    def train(self,split=(64,16,20)):
+    def train(self):
         """Train the model and evaluate on train/val/test splits.
-
-        Args:
-            split (tuple[int, int, int]): Train/val/test percent split.
         """
         smoke_steps = None
         if self.smoke_train:
@@ -1287,7 +1402,6 @@ class EchoFocus:
         switch_every=1,
         transformer_lr=None,
         panecho_lr=None,
-        split=(64,16,20),
     ):
         """Alternate training between transformer-only and PanEcho-only phases.
 
@@ -1297,7 +1411,6 @@ class EchoFocus:
             switch_every (int): Number of epochs per phase.
             transformer_lr (float|None): Optional LR for transformer-only phases.
             panecho_lr (float|None): Optional LR for panecho-only phases.
-            split (tuple[int,int,int]): Train/val/test split.
         """
         if start_with not in ("transformer", "panecho"):
             raise ValueError("start_with must be 'transformer' or 'panecho'")
@@ -1591,13 +1704,7 @@ class EchoFocus:
         """Evaluate the best checkpoint on train/val/test splits."""
         # 10. Compute performance 
         eval_start_time = time.time()
-        # model = self._setup_model() 
-        # best_checkpoint_path = os.path.join(self.model_path, 'best_checkpoint.pt') 
-        # best_model, _, _, _, self.input_norm_dict = load_model_and_random_state(best_checkpoint_path, model)
-
-        model,_,_,_,_ = self._setup_model() 
-        best_checkpoint_path = os.path.join(self.model_path, 'best_checkpoint.pt') 
-        best_model,_,_,_,input_norm_dict  = load_model_and_random_state(best_checkpoint_path, model)
+        best_model, input_norm_dict = self._load_inference_model()
         train_dl,val_dl,test_dl,input_norm_dict = self._setup_data(
             input_norm_dict,
             use_train_transforms=False,
@@ -1623,9 +1730,7 @@ class EchoFocus:
             embed_file (str|None): Output HDF5 path; defaults to model directory.
             split (tuple[int, int, int]): Train/val/test split (unused).
         """
-        model,_,_,_,_ = self._setup_model() 
-        best_checkpoint_path = os.path.join(self.model_path, 'best_checkpoint.pt') 
-        best_model,_,_,_,input_norm_dict  = load_model_and_random_state(best_checkpoint_path, model)
+        best_model, input_norm_dict = self._load_inference_model()
         _,_,dataloader,input_norm_dict = self._setup_data(
             input_norm_dict,
             use_train_transforms=False,
@@ -1643,7 +1748,7 @@ class EchoFocus:
                     embedding = embedding.to("cuda")
 
                 with torch.no_grad():
-                    f[str(eid)] = model.embed(embedding).cpu().numpy()
+                    f[str(eid)] = best_model.embed(embedding).cpu().numpy()
         print(f'saved embeddings to {embed_file}')
 
     @utils.initializer
@@ -1671,9 +1776,7 @@ class EchoFocus:
             else:
                 self.explain_tasks = tuple(self.explain_tasks)
         print('explain_tasks:',self.explain_tasks)
-        model,_,_,_,_ = self._setup_model() 
-        best_checkpoint_path = os.path.join(self.model_path, 'best_checkpoint.pt') 
-        best_model,_,_,_,input_norm_dict  = load_model_and_random_state(best_checkpoint_path, model)
+        best_model, input_norm_dict = self._load_inference_model()
         _,_,test_dataloader,input_norm_dict = self._setup_data(
             input_norm_dict,
             use_train_transforms=False,
