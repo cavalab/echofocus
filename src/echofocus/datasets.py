@@ -454,23 +454,17 @@ def emb_collate(batch):
 def get_dataset(
     embed_path,
     embedding_echo_id_list,
-    limit=1e10,
-    parallel_processes=1,
     preload=False,
     cache_embeddings=False,
     max_cache_gb=None,
-    batch_size=1,
 ):
     """Create an embedding dataset or raise if preload is requested.
 
     Args:
         embed_path (str): Embedding folder path.
         embedding_echo_id_list (list[int]): Echo IDs to include.
-        limit (int): Max number of studies to load when preloading (deprecated).
-        parallel_processes (int): Number of workers (deprecated).
         preload (bool): Deprecated, raises if True.
         cache_embeddings (bool): Cache embeddings on first load.
-        batch_size (int): Batch size used in deprecated preload path.
 
     Returns:
         EmbeddingDataset: Dataset that loads embeddings on demand.
@@ -478,9 +472,6 @@ def get_dataset(
     Raises:
         ValueError: If ``preload`` is True.
     """
-    # returns all embeddings, which are in a folder per study, as a dict
-    study_embeddings = {}
-    study_filenames = {}
     cache_index_path = os.path.join(embed_path, "cache_index.json")
     if os.path.isfile(cache_index_path):
         emb_ds = ShardedEmbeddingDataset(

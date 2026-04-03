@@ -23,7 +23,6 @@ class RuntimeConfig:
     learning_rate: float
     encoder_depth: int
     clip_dropout: float
-    tf_combine: str
     parallel_processes: int
     sample_limit: float
     config_path: str

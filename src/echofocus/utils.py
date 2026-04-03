@@ -195,17 +195,6 @@ def load_random_state(import_dict):
     else:
         print('Could not load random state')
 
-def sigmoid(z):
-    """Compute the logistic sigmoid of ``z``.
-
-    Args:
-        z (numpy.ndarray or float): Input value(s).
-
-    Returns:
-        numpy.ndarray or float: Sigmoid-transformed values.
-    """
-    return 1/(1 + np.exp(-z))
-
 def scatter_plots(model_path, dataset, fold, task_labels, y_true, y_pred):
     """Save scatter plots comparing predicted vs. true labels.
 

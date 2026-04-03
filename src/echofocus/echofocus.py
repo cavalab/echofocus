@@ -59,10 +59,6 @@ class EchoFocus:
         learning_rate=0.0001,  # default to 1e-4
         encoder_depth=0,
         clip_dropout=0.,
-        tf_combine='avg',
-        debug_echo_folder=False,
-        laptop_debug=False,
-        test_only=False,
         parallel_processes=1,
         sample_limit=1e10,
         preload_embeddings=False,
@@ -117,10 +113,6 @@ class EchoFocus:
             learning_rate (float): Optimizer learning rate.
             encoder_depth (int): Number of transformer encoder layers.
             clip_dropout (float): Dropout probability for clip embeddings.
-            tf_combine (str): Pooling method for transformer output.
-            debug_echo_folder (bool): Debug flag for local echo folder.
-            laptop_debug (bool): Debug flag for local laptop use.
-            test_only (bool): If True, run evaluation only.
             parallel_processes (int): Number of dataloader workers.
             sample_limit (int): Limit number of samples.
             run_id (str|None): Optional run ID for reproducibility.
@@ -264,6 +256,7 @@ class EchoFocus:
         self._set_loss()
         self.operation_configs = {}
         self.runtime_config = self._build_runtime_config()
+        self._save_runtime_config()
 
     def _build_runtime_config(self):
         """Capture the resolved, stable configuration for this run."""
@@ -283,7 +276,6 @@ class EchoFocus:
             learning_rate=self.learning_rate,
             encoder_depth=self.encoder_depth,
             clip_dropout=self.clip_dropout,
-            tf_combine=self.tf_combine,
             parallel_processes=self.parallel_processes,
             sample_limit=self.sample_limit,
             config_path=self.config,
@@ -320,14 +312,21 @@ class EchoFocus:
             cli_overrides=tuple(sorted(self._cli_overrides)),
         )
 
+    def _write_json(self, path, payload):
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=2)
+
+    def _save_runtime_config(self):
+        """Persist the resolved run configuration to the model directory."""
+        path = os.path.join(self.model_path, "runtime_config.json")
+        self._write_json(path, asdict(self.runtime_config))
+
     def _record_operation_config(self, op_name, cfg):
         """Persist the effective arguments for an operation invocation."""
         payload = asdict(cfg)
         setattr(self, f"last_{op_name}_config", cfg)
         self.operation_configs[op_name] = payload
-        path = os.path.join(self.model_path, f"{op_name}_config.json")
-        with open(path, "w") as f:
-            json.dump(payload, f, indent=2)
+        self._write_json(os.path.join(self.model_path, f"{op_name}_config.json"), payload)
         return cfg
 
     def _start_gpu_monitor(self):
@@ -408,6 +407,7 @@ class EchoFocus:
         train_args_path = os.path.join(self.model_path, 'train_args.csv')
         if self._apply_training_args_from_csv(train_args_path):
             self.runtime_config = self._build_runtime_config()
+            self._save_runtime_config()
             return
 
         source_paths = [self.load_transformer_path, self.load_panecho_path]
@@ -421,6 +421,7 @@ class EchoFocus:
             seen.add(candidate)
             if self._apply_training_args_from_csv(candidate):
                 self.runtime_config = self._build_runtime_config()
+                self._save_runtime_config()
                 return
 
     def _bootstrap_inference_checkpoint(self, model, input_norm_dict=None):
@@ -487,19 +488,6 @@ class EchoFocus:
     def _set_trainable_flags(self):
         return training_ops.set_trainable_flags(self)
 
-    def _get_last_epoch(self):
-        """Return last trained epoch from checkpoint, or 0 if missing."""
-        last_ckpt = os.path.join(self.model_path, "last_checkpoint.pt")
-        if not os.path.isfile(last_ckpt):
-            return 0
-        try:
-            ckpt = torch.load(last_ckpt, map_location="cpu")
-            if "perf_log" in ckpt and len(ckpt["perf_log"]) > 0:
-                return ckpt["perf_log"][-1][0]
-        except Exception:
-            pass
-        return 0
-
     def _load_config(self):
         """Load dataset/task config and set instance attributes.
 
@@ -526,19 +514,6 @@ class EchoFocus:
             if hasattr(self, k) and getattr(self, k) != v:
                 print(f'WARNING: overriding init arg {k}={getattr(self, k)} with config value {v}')
             setattr(self,k,v)
-
-    def save(self):
-        """Save run parameters to ``cfg.json`` in the run directory."""
-        self.time = time.time() - self.time
-        save_name = f"{self.save_dir}/{self.run_id}/cfg.json"
-        with open(save_name, "w") as of:
-            payload = {
-                k: v
-                for k, v in vars(self).items()
-                if any(isinstance(v, t) for t in [bool, int, float, str, dict, list, tuple])
-            }
-            print("payload:", json.dumps(payload, indent=2))
-            json.dump(payload, of, indent=4)
 
     def _setup_data(self, input_norm_dict=None, use_train_transforms=True):
         return data_ops.setup_data(self, input_norm_dict=input_norm_dict, use_train_transforms=use_train_transforms)

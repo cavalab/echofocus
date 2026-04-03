@@ -310,15 +310,14 @@ def explain(self, cfg):
 
 def _explain_impl(self, cfg):
     original_split = self.split
-    original_explain_tasks = getattr(self, "explain_tasks", None)
     self.split = cfg.split
-    self.explain_tasks = cfg.explain_tasks
-    if isinstance(self.explain_tasks, str):
-        if self.explain_tasks.lower() == 'all':
-            self.explain_tasks = self.task_labels
+    explain_tasks = cfg.explain_tasks
+    if isinstance(explain_tasks, str):
+        if explain_tasks.lower() == 'all':
+            explain_tasks = self.task_labels
         else:
-            self.explain_tasks = tuple(self.explain_tasks)
-    print('explain_tasks:', self.explain_tasks)
+            explain_tasks = (explain_tasks,)
+    print('explain_tasks:', explain_tasks)
     try:
         best_model, input_norm_dict = self._load_inference_model()
         _, _, test_dataloader, input_norm_dict = self._setup_data(input_norm_dict, use_train_transforms=False)
@@ -338,7 +337,7 @@ def _explain_impl(self, cfg):
 
         frames = []
         measure_maes = {'EF05': 0.0277, 'AR01': 0.13}
-        for measure in self.explain_tasks:
+        for measure in explain_tasks:
             task_idx = self.task_labels.index(measure)
             y_trues = y_true_test[:, task_idx]
             y_trues_norm = y_true_test_norm[:, task_idx]
@@ -440,4 +439,3 @@ def _explain_impl(self, cfg):
         print('saved explanations to', os.path.join(self.model_path, explain_file_name))
     finally:
         self.split = original_split
-        self.explain_tasks = original_explain_tasks

@@ -97,11 +97,8 @@ def setup_data(self, input_norm_dict=None, use_train_transforms=True):
         study_embeddings = get_dataset(
             self.embedding_path,
             eid_keep_list,
-            limit=self.sample_limit,
-            parallel_processes=self.parallel_processes,
             cache_embeddings=self.cache_panecho_embeddings,
             max_cache_gb=self.max_panecho_cache_gb,
-            batch_size=self.batch_size,
         )
 
     if self.preload_embeddings and not self.end_to_end:
