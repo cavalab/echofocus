@@ -15,8 +15,6 @@ import time
 from datetime import datetime
 import sys
 import torch.profiler
-import subprocess
-import torch.multiprocessing as mp
 from collections import OrderedDict
 
 # import cv2
@@ -98,7 +96,6 @@ class EchoFocus:
         gpu_monitor_interval=10,
         ram_monitor=False,
         ram_monitor_interval=10,
-        sharing_strategy="file_descriptor",
     ):
         """Initialize training/evaluation state and load config.
 
@@ -150,7 +147,6 @@ class EchoFocus:
             gpu_monitor_interval (int): Seconds between GPU utilization logs.
             ram_monitor (bool): If True, log process RAM usage periodically.
             ram_monitor_interval (int): Seconds between RAM usage logs.
-            sharing_strategy (str): torch.multiprocessing sharing strategy ("file_descriptor" or "file_system").
         """
         self.time = time.time()
         self.datetime = str(datetime.now()).replace(" ", "_")
@@ -165,30 +161,6 @@ class EchoFocus:
         self.max_panecho_cache_gb = max_panecho_cache_gb
         self._panecho_cache = OrderedDict()
         self._panecho_cache_bytes = 0
-
-        if "TORCH_SHM_DIR" not in os.environ:
-            tmp_base = os.environ.get("TMPDIR") or os.environ.get("TMP") or os.environ.get("TEMP")
-            if tmp_base:
-                os.environ["TORCH_SHM_DIR"] = os.path.join(tmp_base, "torch-shm")
-
-        if self.sharing_strategy in ("file_descriptor", "file_system"):
-            mp.set_sharing_strategy(self.sharing_strategy)
-        else:
-            print(f"WARNING: unknown sharing_strategy={self.sharing_strategy}; using file_descriptor")
-            mp.set_sharing_strategy("file_descriptor")
-
-        try:
-            shm_stats = subprocess.check_output(["df", "-h", "/dev/shm"], text=True).strip().splitlines()
-            shm_line = shm_stats[-1] if shm_stats else ""
-        except Exception:
-            shm_line = "unavailable"
-        print(
-            "preflight:",
-            f"sharing_strategy={mp.get_sharing_strategy()}",
-            f"TORCH_SHM_DIR={os.environ.get('TORCH_SHM_DIR', '')}",
-            f"TMPDIR={os.environ.get('TMPDIR', '')}",
-            f"/dev/shm={shm_line}",
-        )
         print(
             "cache:",
             f"video_tensors={self.cache_video_tensors}",
@@ -309,7 +281,6 @@ class EchoFocus:
             gpu_monitor_interval=self.gpu_monitor_interval,
             ram_monitor=self.ram_monitor,
             ram_monitor_interval=self.ram_monitor_interval,
-            sharing_strategy=self.sharing_strategy,
             task_labels=tuple(self.task_labels),
             loss_name=getattr(self.loss_fn, "__name__", self.loss_fn.__class__.__name__),
             cli_overrides=tuple(sorted(self._cli_overrides)),

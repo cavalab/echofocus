@@ -54,7 +54,6 @@ class RuntimeConfig:
     gpu_monitor_interval: int
     ram_monitor: bool
     ram_monitor_interval: int
-    sharing_strategy: str
     task_labels: Tuple[str, ...]
     loss_name: str
     cli_overrides: Tuple[str, ...] = ()
