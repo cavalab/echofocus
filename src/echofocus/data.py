@@ -88,7 +88,8 @@ def setup_data(self, input_norm_dict=None, use_train_transforms=True):
     tmp = tmp[mask]
     print('N echos after in_csv filter:', len(tmp))
 
-    tmp = tmp.loc[tmp[self.task_labels].dropna(how='all').index]
+    task_label_cols = list(self.task_labels)
+    tmp = tmp.loc[tmp[task_label_cols].dropna(how='all').index]
     print('N Echos after excluding missing labels:', len(tmp))
 
     eid_keep_list = tmp['eid'].values
@@ -148,7 +149,7 @@ def setup_data(self, input_norm_dict=None, use_train_transforms=True):
 
         if input_norm_dict is None:
             print('no input_norm_dict loaded, generating from Train_DF')
-            input_norm_dict = utils.get_norm_params(train_df, self.task_labels)
+            input_norm_dict = utils.get_norm_params(train_df, task_label_cols)
         train_df = utils.normalize_df(train_df, input_norm_dict)
         valid_df = utils.normalize_df(valid_df, input_norm_dict)
         test_df = utils.normalize_df(test_df, input_norm_dict)

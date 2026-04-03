@@ -429,7 +429,7 @@ class EchoFocus:
                 continue
             value = runtime_cfg[target_key]
             if target_key == 'task_labels' and isinstance(value, list):
-                value = tuple(value)
+                value = list(value)
             if getattr(self, target_key, None) != value:
                 print(f'WARNING: using {target_key}={value}, loaded from {runtime_config_path}')
                 setattr(self, target_key, value)

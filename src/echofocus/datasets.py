@@ -411,7 +411,7 @@ class CustomDataset(torch.utils.data.Dataset):
         """
         EID = self.dataframe.index[index]
         
-        true_labels = self.dataframe.loc[EID][self.task_labels]
+        true_labels = self.dataframe.loc[EID][list(self.task_labels)]
         # Embeddings = self.embeddings[EID]
         if isinstance(self.embeddings,dict):
             Embeddings = self.embeddings[EID]
