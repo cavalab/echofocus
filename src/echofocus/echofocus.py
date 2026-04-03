@@ -7,8 +7,6 @@ Authors: Platon Lukyanenko, William La Cava
 import pandas as pd
 import os
 import json
-import csv
-import h5py
 import ast
 from dataclasses import asdict
 
@@ -17,11 +15,9 @@ import time
 from datetime import datetime
 import sys
 import torch.profiler
-import threading
 import subprocess
 import torch.multiprocessing as mp
 from collections import OrderedDict
-from sklearn.metrics import roc_auc_score, average_precision_score, median_absolute_error, r2_score
 
 # import cv2
 import numpy as np
@@ -31,7 +27,6 @@ import numpy as np
 # from torchvision.transforms import v2
 
 
-from tqdm import tqdm
 import uuid
 
 from . import utils
@@ -87,7 +82,7 @@ class EchoFocus:
         use_hdf5_index=False,
         label_path=None,
         embedding_path=None,
-        video_base_path="/lab-share/Cardio-Mayourian-e2/Public/Echo_Pulled",
+        video_base_path=None,
         video_subdir_format="{echo_id}_trim",
         max_videos_per_study=None,
         max_video_cache_gb=250,
