@@ -2,6 +2,7 @@
 
 import numpy as np
 import torch
+from tqdm import tqdm
 
 from . import utils
 
@@ -66,7 +67,19 @@ def run_model_on_dataloader(model, dataloader, loss_func_pointer, amp=False, cac
     loss = 0
     is_classification = isinstance(loss_func_pointer, torch.nn.BCEWithLogitsLoss)
     use_amp = amp and torch.cuda.is_available()
-    for embedding, correct_labels, eid in dataloader:
+    pbar = tqdm(dataloader, total=len(dataloader.dataset), desc="Inference")
+    monitor_owner = getattr(model, "_echofocus_monitor_owner", None)
+    for embedding, correct_labels, eid in pbar:
+        postfix = []
+        if monitor_owner is not None:
+            gpu_status = getattr(monitor_owner, "_gpu_status", "")
+            ram_status = getattr(monitor_owner, "_ram_status", "")
+            if gpu_status:
+                postfix.append(f"gpu={gpu_status}")
+            if ram_status:
+                postfix.append(f"ram={ram_status}")
+            if postfix:
+                pbar.set_postfix_str(" ".join(postfix))
         if torch.cuda.is_available():
             embedding = embedding.to("cuda")
             correct_labels = correct_labels.to("cuda")

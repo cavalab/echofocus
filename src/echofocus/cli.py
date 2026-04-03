@@ -2,7 +2,7 @@
 
 import fire
 
-from .app import EchoFocus
+from .echofocus import EchoFocus
 
 
 def main():
