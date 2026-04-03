@@ -552,7 +552,6 @@ class EchoFocus:
 
     # def load_checkpoint(self, checkpoint):
 
-    @utils.initializer
     def train(self):
         return training_ops.train(self)
 
