@@ -59,6 +59,7 @@ class EchoFocus:
         learning_rate=0.0001,  # default to 1e-4
         encoder_depth=0,
         clip_dropout=0.,
+        transformer_type="standard",
         parallel_processes=1,
         sample_limit=1e10,
         preload_embeddings=False,
@@ -113,6 +114,7 @@ class EchoFocus:
             learning_rate (float): Optimizer learning rate.
             encoder_depth (int): Number of transformer encoder layers.
             clip_dropout (float): Dropout probability for clip embeddings.
+            transformer_type (str): Study-level transformer variant: ``"standard"``, ``"query"``, or ``"multiquery"``.
             parallel_processes (int): Number of dataloader workers.
             sample_limit (int): Limit number of samples.
             run_id (str|None): Optional run ID for reproducibility.
@@ -276,6 +278,7 @@ class EchoFocus:
             learning_rate=self.learning_rate,
             encoder_depth=self.encoder_depth,
             clip_dropout=self.clip_dropout,
+            transformer_type=self.transformer_type,
             parallel_processes=self.parallel_processes,
             sample_limit=self.sample_limit,
             config_path=self.config,
@@ -380,7 +383,7 @@ class EchoFocus:
             'encoder_depth': int,
             'clip_dropout': float,
         }
-        direct_keys = ['encoder_depth', 'task_labels', 'clip_dropout']
+        direct_keys = ['encoder_depth', 'task_labels', 'clip_dropout', 'transformer_type']
         legacy_key_map = {
             'target_label_list': 'task_labels',
         }
@@ -411,10 +414,37 @@ class EchoFocus:
                 applied = True
         return applied
 
+    def _apply_training_args_from_runtime_config(self, runtime_config_path):
+        """Apply key architecture settings from a saved runtime config JSON."""
+        if not os.path.isfile(runtime_config_path):
+            return False
+
+        with open(runtime_config_path, "r") as f:
+            runtime_cfg = json.load(f)
+
+        direct_keys = ['encoder_depth', 'task_labels', 'clip_dropout', 'transformer_type']
+        applied = False
+        for target_key in direct_keys:
+            if target_key not in runtime_cfg or target_key in self._cli_overrides:
+                continue
+            value = runtime_cfg[target_key]
+            if target_key == 'task_labels' and isinstance(value, list):
+                value = tuple(value)
+            if getattr(self, target_key, None) != value:
+                print(f'WARNING: using {target_key}={value}, loaded from {runtime_config_path}')
+                setattr(self, target_key, value)
+                applied = True
+        return applied
+
     def _maybe_apply_source_train_args(self):
-        """Load train args from the target run directory or source checkpoints."""
+        """Load architecture metadata from the target run directory or source checkpoints."""
         train_args_path = os.path.join(self.model_path, 'train_args.csv')
         if self._apply_training_args_from_csv(train_args_path):
+            self.runtime_config = self._build_runtime_config()
+            self._save_runtime_config()
+            return
+        runtime_config_path = os.path.join(self.model_path, 'runtime_config.json')
+        if self._apply_training_args_from_runtime_config(runtime_config_path):
             self.runtime_config = self._build_runtime_config()
             self._save_runtime_config()
             return
@@ -424,14 +454,24 @@ class EchoFocus:
         for source_path in source_paths:
             if not source_path:
                 continue
-            candidate = os.path.join(os.path.dirname(os.path.abspath(source_path)), 'train_args.csv')
-            if candidate in seen:
+            source_dir = os.path.dirname(os.path.abspath(source_path))
+            candidates = [
+                os.path.join(source_dir, 'train_args.csv'),
+                os.path.join(source_dir, 'runtime_config.json'),
+            ]
+            if source_dir in seen:
                 continue
-            seen.add(candidate)
-            if self._apply_training_args_from_csv(candidate):
-                self.runtime_config = self._build_runtime_config()
-                self._save_runtime_config()
-                return
+            seen.add(source_dir)
+            for candidate in candidates:
+                applied = False
+                if candidate.endswith('.csv'):
+                    applied = self._apply_training_args_from_csv(candidate)
+                else:
+                    applied = self._apply_training_args_from_runtime_config(candidate)
+                if applied:
+                    self.runtime_config = self._build_runtime_config()
+                    self._save_runtime_config()
+                    return
 
     def _bootstrap_inference_checkpoint(self, model, input_norm_dict=None):
         """Persist a synthetic best checkpoint from directly loaded weights."""
@@ -659,12 +699,13 @@ class EchoFocus:
         elif self.task in ['chd','fyler']:
             self.loss_fn = torch.nn.BCEWithLogitsLoss()
 
-    def embed(self, embed_file=None, split=(0,0,100)):
+    def embed(self, embed_file=None, split=(0,0,100), pool_queries=True):
         cfg = self._record_operation_config(
             "embed",
             EmbedConfig(
                 embed_file=embed_file,
                 split=tuple(split),
+                pool_queries=pool_queries,
             ),
         )
         return evaluation_ops.embed(self, cfg)

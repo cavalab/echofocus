@@ -23,6 +23,7 @@ class RuntimeConfig:
     learning_rate: float
     encoder_depth: int
     clip_dropout: float
+    transformer_type: str
     parallel_processes: int
     sample_limit: float
     config_path: str
@@ -73,6 +74,7 @@ class EmbedConfig:
 
     embed_file: Optional[str] = None
     split: Tuple[int, int, int] = (0, 0, 100)
+    pool_queries: bool = True
 
 
 @dataclass

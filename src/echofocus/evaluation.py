@@ -295,7 +295,10 @@ def embed(self, cfg):
                     if torch.cuda.is_available():
                         embedding = embedding.to("cuda")
                     with torch.no_grad():
-                        f[str(eid)] = best_model.embed(embedding).cpu().numpy()
+                        f[str(eid)] = best_model.embed(
+                            embedding,
+                            pool_queries=cfg.pool_queries,
+                        ).cpu().numpy()
         finally:
             self.split = original_split
         print(f'saved embeddings to {resolved_embed_file}')

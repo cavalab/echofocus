@@ -77,11 +77,12 @@ class CustomTransformer(nn.Module):
             raise ValueError(f"Unexpected embedding tensor shape: {tuple(x.shape)}")
         return torch.vstack([k for k in x])
 
-    def embed(self, x):
+    def embed(self, x, pool_queries=True):
         """Return pooled encoder representation for a set of clips.
 
         Args:
             x (iterable[torch.Tensor]): Sequence of clip embeddings.
+            pool_queries (bool): Ignored for this model; kept for API compatibility.
 
         Returns:
             torch.Tensor: Pooled representation vector.
@@ -148,7 +149,7 @@ class EchoFocusEndToEnd(nn.Module):
         n_encoder_layers=0,
         output_size=1,
         clip_dropout=0,
-        tf_combine="avg",
+        transformer_type="standard",
         panecho_trainable=True,
         debug_mem=False,
         checkpoint_panecho=False,
@@ -161,7 +162,7 @@ class EchoFocusEndToEnd(nn.Module):
             n_encoder_layers (int): Number of transformer encoder layers.
             output_size (int): Number of output targets.
             clip_dropout (float): Dropout probability for clip embeddings.
-            tf_combine (str): Pooling method.
+            transformer_type (str): Study-level transformer variant.
             panecho_trainable (bool): Whether PanEcho backbone is trainable.
             debug_mem (bool): If True, print CUDA memory stats around PanEcho.
             checkpoint_panecho (bool): If True, checkpoint PanEcho forward to save memory.
@@ -170,14 +171,35 @@ class EchoFocusEndToEnd(nn.Module):
         self.debug_mem = debug_mem
         self.checkpoint_panecho = checkpoint_panecho
         self.panecho = PanEchoBackbone(backbone_only=True, trainable=panecho_trainable)
-        self.transformer = CustomTransformer(
-            input_size=input_size,
-            encoder_dim=encoder_dim,
-            n_encoder_layers=n_encoder_layers,
-            output_size=output_size,
-            clip_dropout=clip_dropout,
-            tf_combine=tf_combine,
-        )
+        if transformer_type == "standard":
+            self.transformer = CustomTransformer(
+                input_size=input_size,
+                encoder_dim=encoder_dim,
+                n_encoder_layers=n_encoder_layers,
+                output_size=output_size,
+                clip_dropout=clip_dropout,
+                tf_combine="avg",
+            )
+        elif transformer_type == "query":
+            self.transformer = CustomQueryTransformer(
+                input_size=input_size,
+                encoder_dim=encoder_dim,
+                n_encoder_layers=n_encoder_layers,
+                output_size=output_size,
+                clip_dropout=clip_dropout,
+            )
+        elif transformer_type == "multiquery":
+            self.transformer = CustomMultiQueryTransformer(
+                input_size=input_size,
+                encoder_dim=encoder_dim,
+                n_encoder_layers=n_encoder_layers,
+                output_size=output_size,
+                clip_dropout=clip_dropout,
+            )
+        else:
+            raise ValueError(
+                f"transformer_type must be one of ('standard', 'query', 'multiquery'); got {transformer_type!r}"
+            )
 
     def _mem(self,tag):
         if not self.debug_mem or not torch.cuda.is_available():
@@ -222,10 +244,10 @@ class EchoFocusEndToEnd(nn.Module):
         self._mem("transformer after")
         return embeddings
 
-    def embed(self, clips):
+    def embed(self, clips, pool_queries=True):
         """Return pooled representation from raw clips."""
         embeddings = self._panecho_embed(clips)
-        return self.transformer.embed(embeddings)
+        return self.transformer.embed(embeddings, pool_queries=pool_queries)
         
 class CustomQueryTransformer(nn.Module):
     """Transformer with a learned query token for set pooling."""
@@ -283,6 +305,30 @@ class CustomQueryTransformer(nn.Module):
         # Final linear head (multitask logits)
         self.ff = nn.Linear(in_features=ff_in_dim, out_features=output_size)
 
+    def _stack_embeddings(self, x):
+        """Stack embeddings from list/tuple or tensor input."""
+        if torch.is_tensor(x):
+            if x.ndim == 3:
+                return x.reshape(-1, x.shape[-1])
+            if x.ndim == 2:
+                return x
+            raise ValueError(f"Unexpected embedding tensor shape: {tuple(x.shape)}")
+        return torch.vstack(list(x))
+
+    def embed(self, x, pool_queries=True):
+        """Return pooled query representation for a set of clips."""
+        x = self._stack_embeddings(x).unsqueeze(0)
+        x = self.clip_dropout(x)
+        q = self.query_token.to(x.dtype).to(x.device).expand(x.shape[0], -1, -1)
+        x = torch.cat([q, x], dim=1)
+
+        if isinstance(self.encoder, nn.MultiheadAttention):
+            attn_output, _ = self.encoder(x, x, x, need_weights=False)
+            out = attn_output
+        else:
+            out = self.encoder(x)
+        return out[:, 0, :].squeeze(0)
+
     def forward(self, x):
         """Compute model outputs for a set of video embeddings.
 
@@ -294,7 +340,7 @@ class CustomQueryTransformer(nn.Module):
         """
         # (n_videos, D)
         # x = torch.stack(list(x), dim=0)
-        x = torch.vstack(list(x)) 
+        x = self._stack_embeddings(x)
 
         # (1, n_videos, D)
         x = x.unsqueeze(0)
@@ -321,6 +367,96 @@ class CustomQueryTransformer(nn.Module):
         linear_out = self.ff(pooled)   # (1, output_size)
 
         return linear_out.squeeze(0)   # (output_size,)
+
+
+class CustomMultiQueryTransformer(nn.Module):
+    """Transformer with one learned query token per output task."""
+
+    def __init__(
+        self,
+        input_size=768,
+        encoder_dim=768,
+        n_encoder_layers=0,
+        output_size=1,
+        clip_dropout=0,
+        n_heads=6,
+    ):
+        """Initialize a transformer with task-specific query tokens.
+
+        Args:
+            input_size (int): Input embedding dimension.
+            encoder_dim (int): Feed-forward dimension in the encoder layer.
+            n_encoder_layers (int): Number of encoder layers.
+            output_size (int): Number of output targets / learned query tokens.
+            clip_dropout (float): Dropout probability for clip embeddings.
+            n_heads (int): Number of attention heads.
+        """
+        super().__init__()
+
+        self.clip_dropout = CustomDropout(clip_dropout)
+        self.output_size = output_size
+
+        self.query_tokens = nn.Parameter(torch.zeros(1, output_size, input_size))
+        nn.init.normal_(self.query_tokens, mean=0.0, std=0.02)
+
+        if n_encoder_layers == 0:
+            self.encoder = nn.MultiheadAttention(
+                embed_dim=input_size,
+                num_heads=n_heads,
+                dropout=0.2,
+                batch_first=True,
+            )
+            ff_in_dim = input_size
+        else:
+            enc_layer = nn.TransformerEncoderLayer(
+                d_model=input_size,
+                nhead=n_heads,
+                dim_feedforward=encoder_dim,
+                dropout=0.2,
+                batch_first=True,
+            )
+            self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_encoder_layers)
+            ff_in_dim = input_size
+
+        # Shared scalar head across task-query outputs; task identity is carried by the query token.
+        self.ff = nn.Linear(in_features=ff_in_dim, out_features=1)
+
+    def _stack_embeddings(self, x):
+        """Stack embeddings from list/tuple or tensor input."""
+        if torch.is_tensor(x):
+            if x.ndim == 3:
+                return x.reshape(-1, x.shape[-1])
+            if x.ndim == 2:
+                return x
+            raise ValueError(f"Unexpected embedding tensor shape: {tuple(x.shape)}")
+        return torch.vstack(list(x))
+
+    def _encode(self, x):
+        """Run the encoder and return one pooled representation per task query."""
+        x = self._stack_embeddings(x).unsqueeze(0)
+        x = self.clip_dropout(x)
+        q = self.query_tokens.to(x.dtype).to(x.device).expand(x.shape[0], -1, -1)
+        x = torch.cat([q, x], dim=1)
+
+        if isinstance(self.encoder, nn.MultiheadAttention):
+            attn_output, _ = self.encoder(x, x, x, need_weights=False)
+            out = attn_output
+        else:
+            out = self.encoder(x)
+        return out[:, : self.output_size, :]
+
+    def embed(self, x, pool_queries=True):
+        """Return task-query representations or their mean-pooled summary."""
+        pooled = self._encode(x).squeeze(0)
+        if pool_queries:
+            return pooled.mean(dim=0)
+        return pooled
+
+    def forward(self, x):
+        """Compute one output per task-specific query token."""
+        pooled = self._encode(x)
+        logits = self.ff(pooled).squeeze(-1)
+        return logits.squeeze(0)
 
 # class CustomTransformer (nn.Module):
 #     # if n_layers = 0 -> MHA

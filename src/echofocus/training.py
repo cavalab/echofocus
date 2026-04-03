@@ -9,7 +9,7 @@ from tqdm import tqdm
 
 from . import utils
 from .checkpoints import load_model_and_random_state, run_model_on_dataloader, save_nn
-from .models import CustomTransformer, EchoFocusEndToEnd
+from .models import CustomMultiQueryTransformer, CustomQueryTransformer, CustomTransformer, EchoFocusEndToEnd
 from .monitoring import start_gpu_monitor, start_ram_monitor
 
 
@@ -41,20 +41,41 @@ def setup_model(self):
             n_encoder_layers=self.encoder_depth,
             output_size=len(self.task_labels),
             clip_dropout=self.clip_dropout,
-            tf_combine="avg",
+            transformer_type=self.transformer_type,
             panecho_trainable=self.panecho_trainable,
             debug_mem=self.debug_mem,
             checkpoint_panecho=self.checkpoint_panecho,
         )
     else:
-        self.model = CustomTransformer(
-            input_size=768,
-            encoder_dim=768,
-            n_encoder_layers=self.encoder_depth,
-            output_size=len(self.task_labels),
-            clip_dropout=self.clip_dropout,
-            tf_combine="avg",
-        )
+        if self.transformer_type == "standard":
+            self.model = CustomTransformer(
+                input_size=768,
+                encoder_dim=768,
+                n_encoder_layers=self.encoder_depth,
+                output_size=len(self.task_labels),
+                clip_dropout=self.clip_dropout,
+                tf_combine="avg",
+            )
+        elif self.transformer_type == "query":
+            self.model = CustomQueryTransformer(
+                input_size=768,
+                encoder_dim=768,
+                n_encoder_layers=self.encoder_depth,
+                output_size=len(self.task_labels),
+                clip_dropout=self.clip_dropout,
+            )
+        elif self.transformer_type == "multiquery":
+            self.model = CustomMultiQueryTransformer(
+                input_size=768,
+                encoder_dim=768,
+                n_encoder_layers=self.encoder_depth,
+                output_size=len(self.task_labels),
+                clip_dropout=self.clip_dropout,
+            )
+        else:
+            raise ValueError(
+                f"transformer_type must be one of ('standard', 'query', 'multiquery'); got {self.transformer_type!r}"
+            )
     self._set_trainable_flags()
     total_params = sum(p.numel() for p in self.model.parameters())
     trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
