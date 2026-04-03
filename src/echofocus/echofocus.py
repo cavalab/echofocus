@@ -316,17 +316,26 @@ class EchoFocus:
         with open(path, "w") as f:
             json.dump(payload, f, indent=2)
 
+    def _history_path(self, basename):
+        history_dir = os.path.join(self.model_path, "config_history")
+        os.makedirs(history_dir, exist_ok=True)
+        stem, ext = os.path.splitext(basename)
+        return os.path.join(history_dir, f"{stem}.{self.run_id}{ext}")
+
     def _save_runtime_config(self):
         """Persist the resolved run configuration to the model directory."""
-        path = os.path.join(self.model_path, "runtime_config.json")
-        self._write_json(path, asdict(self.runtime_config))
+        payload = asdict(self.runtime_config)
+        self._write_json(os.path.join(self.model_path, "runtime_config.json"), payload)
+        self._write_json(self._history_path("runtime_config.json"), payload)
 
     def _record_operation_config(self, op_name, cfg):
         """Persist the effective arguments for an operation invocation."""
         payload = asdict(cfg)
         setattr(self, f"last_{op_name}_config", cfg)
         self.operation_configs[op_name] = payload
-        self._write_json(os.path.join(self.model_path, f"{op_name}_config.json"), payload)
+        basename = f"{op_name}_config.json"
+        self._write_json(os.path.join(self.model_path, basename), payload)
+        self._write_json(self._history_path(basename), payload)
         return cfg
 
     def _start_gpu_monitor(self):
