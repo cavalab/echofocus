@@ -398,27 +398,20 @@ def run_training_loop(
         self.get_metrics(fold=fold)
 
 
-def train_ping_pong(
-    self,
-    total_epochs=10,
-    start_with="transformer",
-    switch_every=1,
-    transformer_lr=None,
-    panecho_lr=None,
-):
+def train_ping_pong(self, cfg):
     """Alternate training between transformer-only and PanEcho-only phases."""
-    if start_with not in ("transformer", "panecho"):
+    if cfg.start_with not in ("transformer", "panecho"):
         raise ValueError("start_with must be 'transformer' or 'panecho'")
     smoke_steps = None
     if self.smoke_train:
-        if total_epochs < 1:
-            total_epochs = 1
+        if cfg.total_epochs < 1:
+            cfg.total_epochs = 1
         self.epoch_early_stop = 1
         self.sample_limit = min(self.sample_limit, 5000)
         smoke_steps = self.smoke_num_steps
-        print("smoke_train enabled:", f"samples={self.sample_limit}, steps={smoke_steps}, epochs={total_epochs}")
+        print("smoke_train enabled:", f"samples={self.sample_limit}, steps={smoke_steps}, epochs={cfg.total_epochs}")
 
-    self.total_epochs = int(total_epochs)
+    self.total_epochs = int(cfg.total_epochs)
     model, current_epoch, best_epoch, best_loss, input_norm_dict = self._setup_model()
     train_dataloader, val_dataloader, test_dataloader, input_norm_dict = self._setup_data(
         input_norm_dict,
@@ -426,8 +419,8 @@ def train_ping_pong(
     )
 
     orig_lr = self.learning_rate
-    switch_every = max(1, int(switch_every))
-    start_phase_idx = 0 if start_with == "transformer" else 1
+    switch_every = max(1, int(cfg.switch_every))
+    start_phase_idx = 0 if cfg.start_with == "transformer" else 1
 
     def _epoch_hook(epoch):
         phase_idx = ((epoch // switch_every) + start_phase_idx) % 2
@@ -435,12 +428,12 @@ def train_ping_pong(
             print(f"phase: transformer-only epoch {epoch}")
             self.panecho_trainable = False
             self.transformer_trainable = True
-            self.learning_rate = transformer_lr if transformer_lr is not None else orig_lr
+            self.learning_rate = cfg.transformer_lr if cfg.transformer_lr is not None else orig_lr
         else:
             print(f"phase: panecho-only epoch {epoch}")
             self.panecho_trainable = True
             self.transformer_trainable = False
-            self.learning_rate = panecho_lr if panecho_lr is not None else orig_lr
+            self.learning_rate = cfg.panecho_lr if cfg.panecho_lr is not None else orig_lr
 
     self._run_training_loop(
         model,

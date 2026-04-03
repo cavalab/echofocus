@@ -224,11 +224,12 @@ def get_metrics(self, fold='test', dataset=None, n_bootstrap=1000, model_name=No
     return out
 
 
-def evaluate(self, split=None, folds=('train', 'val', 'test')):
+def evaluate(self, cfg):
     """Evaluate the best checkpoint on train/val/test splits."""
     def _run():
-        if split is not None:
-            self.split = split
+        original_split = self.split
+        if cfg.split is not None:
+            self.split = cfg.split
         monitor_thread = None
         monitor_stop = None
         if self.gpu_monitor:
@@ -248,7 +249,7 @@ def evaluate(self, split=None, folds=('train', 'val', 'test')):
                 'val': val_dl,
                 'test': test_dl,
             }
-            selected_folds = [fold.lower() for fold in folds]
+            selected_folds = [fold.lower() for fold in cfg.folds]
             invalid = [fold for fold in selected_folds if fold not in fold_map]
             if invalid:
                 raise ValueError(f"folds must be chosen from ('train', 'val', 'test'); got {invalid}")
@@ -267,169 +268,176 @@ def evaluate(self, split=None, folds=('train', 'val', 'test')):
                 ram_stop.set()
             if ram_thread is not None:
                 ram_thread.join(timeout=1.0)
+            self.split = original_split
 
     return _run_in_eval_mode(self, _run)
 
 
-def embed(self, embed_file=None, split=(0, 0, 100)):
+def embed(self, cfg):
     """Generate and save embedding vectors for each study."""
     def _run():
+        original_split = self.split
+        self.split = cfg.split
         best_model, input_norm_dict = self._load_inference_model()
         _, _, dataloader, input_norm_dict = self._setup_data(input_norm_dict, use_train_transforms=False)
 
-        if embed_file is None:
+        if cfg.embed_file is None:
             resolved_embed_file = os.path.join(self.model_path, f'embeddings_{self.dataset}_{self.task}.h5')
         else:
-            resolved_embed_file = embed_file
-        with h5py.File(resolved_embed_file, 'w') as f:
-            f.attrs['dataset'] = self.dataset
-            f.attrs['model_name'] = self.model_name
-            f.attrs['task'] = self.task
-            pbar = tqdm(dataloader, total=len(dataloader.dataset))
-            for embedding, correct_labels, eid in pbar:
-                if torch.cuda.is_available():
-                    embedding = embedding.to("cuda")
-                with torch.no_grad():
-                    f[str(eid)] = best_model.embed(embedding).cpu().numpy()
+            resolved_embed_file = cfg.embed_file
+        try:
+            with h5py.File(resolved_embed_file, 'w') as f:
+                f.attrs['dataset'] = self.dataset
+                f.attrs['model_name'] = self.model_name
+                f.attrs['task'] = self.task
+                pbar = tqdm(dataloader, total=len(dataloader.dataset))
+                for embedding, correct_labels, eid in pbar:
+                    if torch.cuda.is_available():
+                        embedding = embedding.to("cuda")
+                    with torch.no_grad():
+                        f[str(eid)] = best_model.embed(embedding).cpu().numpy()
+        finally:
+            self.split = original_split
         print(f'saved embeddings to {resolved_embed_file}')
 
     return _run_in_eval_mode(self, _run)
 
 
-def explain(self, explain=False, explain_n=5, explain_mode='pred', explain_tasks=('EF05', 'AR01'), split=(0, 0, 100)):
+def explain(self, cfg):
     """Generate integrated gradients explanations and save to CSV."""
-    return _run_in_eval_mode(self, lambda: _explain_impl(
-        self,
-        explain=explain,
-        explain_n=explain_n,
-        explain_mode=explain_mode,
-        explain_tasks=explain_tasks,
-        split=split,
-    ))
+    return _run_in_eval_mode(self, lambda: _explain_impl(self, cfg))
 
 
-def _explain_impl(self, explain=False, explain_n=5, explain_mode='pred', explain_tasks=('EF05', 'AR01'), split=(0, 0, 100)):
+def _explain_impl(self, cfg):
+    original_split = self.split
+    original_explain_tasks = getattr(self, "explain_tasks", None)
+    self.split = cfg.split
+    self.explain_tasks = cfg.explain_tasks
     if isinstance(self.explain_tasks, str):
         if self.explain_tasks.lower() == 'all':
             self.explain_tasks = self.task_labels
         else:
             self.explain_tasks = tuple(self.explain_tasks)
     print('explain_tasks:', self.explain_tasks)
-    best_model, input_norm_dict = self._load_inference_model()
-    _, _, test_dataloader, input_norm_dict = self._setup_data(input_norm_dict, use_train_transforms=False)
+    try:
+        best_model, input_norm_dict = self._load_inference_model()
+        _, _, test_dataloader, input_norm_dict = self._setup_data(input_norm_dict, use_train_transforms=False)
 
-    print('run model on test set')
-    return_model_outputs, return_correct_outputs, return_eids, loss = run_model_on_dataloader(
-        best_model, test_dataloader, self.loss_fn, amp=self.amp
-    )
-    return_correct_output_np = np.array(return_correct_outputs).squeeze()
-    y_true_test_norm = return_correct_output_np
-    return_model_output_np = np.array(return_model_outputs)
-    if self.task == 'measure':
-        return_model_output_np = utils.un_normalize_output(return_model_output_np, self.task_labels, input_norm_dict)
-        return_correct_output_np = utils.un_normalize_output(return_correct_output_np, self.task_labels, input_norm_dict)
-    y_pred_test = return_model_output_np
-    y_true_test = return_correct_output_np
-
-    frames = []
-    measure_maes = {'EF05': 0.0277, 'AR01': 0.13}
-    for measure in self.explain_tasks:
-        task_idx = self.task_labels.index(measure)
-        y_trues = y_true_test[:, task_idx]
-        y_trues_norm = y_true_test_norm[:, task_idx]
-        y_preds = y_pred_test[:, task_idx]
+        print('run model on test set')
+        return_model_outputs, return_correct_outputs, return_eids, loss = run_model_on_dataloader(
+            best_model, test_dataloader, self.loss_fn, amp=self.amp
+        )
+        return_correct_output_np = np.array(return_correct_outputs).squeeze()
+        y_true_test_norm = return_correct_output_np
+        return_model_output_np = np.array(return_model_outputs)
         if self.task == 'measure':
-            quantiles = [0.] + [np.nanquantile(y_trues, i) for i in [.2, .4, .6, .8, 1.]]
-            test_errors = np.abs(y_trues - y_preds)
-            sample_size = 10
-        else:
-            quantiles = [0.5, 1.]
-            y_pred_top100 = np.sort(y_preds)[-100:][0]
-            sample_size = 50
-        print('quantiles for', measure, ':', quantiles)
-        sample_idxs = np.arange(len(y_trues))
-        for q_bot, q_top in zip(quantiles[:-1], quantiles[1:]):
+            return_model_output_np = utils.un_normalize_output(return_model_output_np, self.task_labels, input_norm_dict)
+            return_correct_output_np = utils.un_normalize_output(return_correct_output_np, self.task_labels, input_norm_dict)
+        y_pred_test = return_model_output_np
+        y_true_test = return_correct_output_np
+
+        frames = []
+        measure_maes = {'EF05': 0.0277, 'AR01': 0.13}
+        for measure in self.explain_tasks:
+            task_idx = self.task_labels.index(measure)
+            y_trues = y_true_test[:, task_idx]
+            y_trues_norm = y_true_test_norm[:, task_idx]
+            y_preds = y_pred_test[:, task_idx]
             if self.task == 'measure':
-                mask = (
-                    (~np.isnan(y_trues))
-                    & (y_trues > q_bot)
-                    & (y_trues <= q_top)
-                    & (test_errors < measure_maes[measure])
-                )
+                quantiles = [0.] + [np.nanquantile(y_trues, i) for i in [.2, .4, .6, .8, 1.]]
+                test_errors = np.abs(y_trues - y_preds)
+                sample_size = 10
             else:
-                mask = (
-                    (~np.isnan(y_trues))
-                    & (y_trues > q_bot)
-                    & (y_trues <= q_top)
-                    & (y_preds > y_pred_top100)
-                )
-            sample_idxs_subset = sample_idxs[mask]
-            if len(sample_idxs_subset) <= sample_size:
-                print('not enough samples (len subset:', len(sample_idxs_subset), ')', 'sample_size:', sample_size)
-                print('there are ', (~np.isnan(y_trues)).sum(), 'non-missing labels')
-                print('there are ', ((y_trues > q_bot) & (y_trues <= q_top)).sum(), f'samples in [{q_bot},{q_top}]')
-                if self.task != 'measure':
-                    print('there are', (y_preds > y_pred_top100).sum(), 'predictions >', y_pred_top100)
-                    print('try relaxing y_pred_top100 constraint')
-                    mask = (~np.isnan(y_trues)) & (y_trues > q_bot) & (y_trues <= q_top)
-                    sample_idxs_subset = sample_idxs[mask]
-                if len(sample_idxs_subset) <= sample_size:
-                    print('didnt work, adjusting samples to', len(sample_idxs_subset))
-                    sample_size = len(sample_idxs_subset)
-                    print('new sample size:', sample_size)
-            assert len(sample_idxs_subset) >= sample_size, "not enough samples per quantile"
-            chosen_idxs = np.random.choice(sample_idxs_subset, size=sample_size, replace=False)
-            for i in chosen_idxs:
-                sample = test_dataloader.dataset[i]
-                y_true = y_trues[i]
-                y_true_norm = y_trues_norm[i]
-                y_pred = y_preds[i]
-                if isinstance(test_dataloader.dataset, torch.utils.data.Subset):
-                    study_filenames, echo_id = test_dataloader.dataset.dataset.get_filenames(i)
-                else:
-                    study_filenames, echo_id = test_dataloader.dataset.get_filenames(i)
-                x_list, y, idx = sample
-                y_norm = y.cpu().numpy().T
+                quantiles = [0.5, 1.]
+                y_pred_top100 = np.sort(y_preds)[-100:][0]
+                sample_size = 50
+            print('quantiles for', measure, ':', quantiles)
+            sample_idxs = np.arange(len(y_trues))
+            for q_bot, q_top in zip(quantiles[:-1], quantiles[1:]):
                 if self.task == 'measure':
-                    y = utils.un_normalize_output(y_norm, self.task_labels, input_norm_dict)
-                y = y.reshape(-1)
-                assert y[task_idx] == y_true
-                assert not np.isnan(y_true)
-
-                scores, attrs, obj, yhat = integrated_gradients_video_level(
-                    best_model,
-                    x_list,
-                    mode=explain_mode,
-                    loss='mae' if self.task == 'measure' else 'bce_logits',
-                    y_true=y_true_norm,
-                    task_type="regression" if self.task == 'measure' else 'classification',
-                    task_idx=task_idx,
-                    steps=64,
-                )
-                scores = scores.cpu().numpy()
-                cap = min(x_list.shape[0], explain_n)
-                ind = np.argpartition(scores, -cap)[-cap::-1]
-                top5scores = scores[ind]
-                top_filenames = study_filenames[ind]
-                if self.task != 'measure':
-                    loss = -(y_true * np.log(y_pred) + (1 - y_true) * np.log(1 - y_pred))
+                    mask = (
+                        (~np.isnan(y_trues))
+                        & (y_trues > q_bot)
+                        & (y_trues <= q_top)
+                        & (test_errors < measure_maes[measure])
+                    )
                 else:
-                    loss = np.abs(y_true - y_pred)
-                result = dict(measure=measure, echo_id=echo_id, y_pred=y_pred, y_true=y_true, loss=loss)
-
-                for k in np.arange(explain_n):
-                    if k >= len(top_filenames):
-                        result[f'top_video_{k+1}'] = None
-                        result[f'top_video_{k+1}_score'] = None
+                    mask = (
+                        (~np.isnan(y_trues))
+                        & (y_trues > q_bot)
+                        & (y_trues <= q_top)
+                        & (y_preds > y_pred_top100)
+                    )
+                sample_idxs_subset = sample_idxs[mask]
+                if len(sample_idxs_subset) <= sample_size:
+                    print('not enough samples (len subset:', len(sample_idxs_subset), ')', 'sample_size:', sample_size)
+                    print('there are ', (~np.isnan(y_trues)).sum(), 'non-missing labels')
+                    print('there are ', ((y_trues > q_bot) & (y_trues <= q_top)).sum(), f'samples in [{q_bot},{q_top}]')
+                    if self.task != 'measure':
+                        print('there are', (y_preds > y_pred_top100).sum(), 'predictions >', y_pred_top100)
+                        print('try relaxing y_pred_top100 constraint')
+                        mask = (~np.isnan(y_trues)) & (y_trues > q_bot) & (y_trues <= q_top)
+                        sample_idxs_subset = sample_idxs[mask]
+                    if len(sample_idxs_subset) <= sample_size:
+                        print('didnt work, adjusting samples to', len(sample_idxs_subset))
+                        sample_size = len(sample_idxs_subset)
+                        print('new sample size:', sample_size)
+                assert len(sample_idxs_subset) >= sample_size, "not enough samples per quantile"
+                chosen_idxs = np.random.choice(sample_idxs_subset, size=sample_size, replace=False)
+                for i in chosen_idxs:
+                    sample = test_dataloader.dataset[i]
+                    y_true = y_trues[i]
+                    y_true_norm = y_trues_norm[i]
+                    y_pred = y_preds[i]
+                    if isinstance(test_dataloader.dataset, torch.utils.data.Subset):
+                        study_filenames, echo_id = test_dataloader.dataset.dataset.get_filenames(i)
                     else:
-                        result[f'top_video_{k+1}'] = top_filenames[k]
-                        result[f'top_video_{k+1}_score'] = top5scores[k]
-                frames.append(result)
-    df_explain = pd.DataFrame(frames)
-    tv_cols = [c for c in df_explain.columns if 'top_video' in c and 'score' not in c]
-    tvs_cols = [c for c in df_explain.columns if 'top_video' in c and 'score' in c]
-    df_explain = df_explain[['echo_id', 'measure', 'y_true', 'y_pred', 'loss'] + tv_cols + tvs_cols]
-    df_explain['dataset'] = self.dataset
-    explain_file_name = f'explanation_test_{self.dataset}.explain_n-{explain_n}.mode-{explain_mode}.csv'
-    df_explain.to_csv(os.path.join(self.model_path, explain_file_name))
-    print('saved explanations to', os.path.join(self.model_path, explain_file_name))
+                        study_filenames, echo_id = test_dataloader.dataset.get_filenames(i)
+                    x_list, y, idx = sample
+                    y_norm = y.cpu().numpy().T
+                    if self.task == 'measure':
+                        y = utils.un_normalize_output(y_norm, self.task_labels, input_norm_dict)
+                    y = y.reshape(-1)
+                    assert y[task_idx] == y_true
+                    assert not np.isnan(y_true)
+
+                    scores, attrs, obj, yhat = integrated_gradients_video_level(
+                        best_model,
+                        x_list,
+                        mode=cfg.explain_mode,
+                        loss='mae' if self.task == 'measure' else 'bce_logits',
+                        y_true=y_true_norm,
+                        task_type="regression" if self.task == 'measure' else 'classification',
+                        task_idx=task_idx,
+                        steps=64,
+                    )
+                    scores = scores.cpu().numpy()
+                    cap = min(x_list.shape[0], cfg.explain_n)
+                    ind = np.argpartition(scores, -cap)[-cap::-1]
+                    top5scores = scores[ind]
+                    top_filenames = study_filenames[ind]
+                    if self.task != 'measure':
+                        loss = -(y_true * np.log(y_pred) + (1 - y_true) * np.log(1 - y_pred))
+                    else:
+                        loss = np.abs(y_true - y_pred)
+                    result = dict(measure=measure, echo_id=echo_id, y_pred=y_pred, y_true=y_true, loss=loss)
+
+                    for k in np.arange(cfg.explain_n):
+                        if k >= len(top_filenames):
+                            result[f'top_video_{k+1}'] = None
+                            result[f'top_video_{k+1}_score'] = None
+                        else:
+                            result[f'top_video_{k+1}'] = top_filenames[k]
+                            result[f'top_video_{k+1}_score'] = top5scores[k]
+                    frames.append(result)
+        df_explain = pd.DataFrame(frames)
+        tv_cols = [c for c in df_explain.columns if 'top_video' in c and 'score' not in c]
+        tvs_cols = [c for c in df_explain.columns if 'top_video' in c and 'score' in c]
+        df_explain = df_explain[['echo_id', 'measure', 'y_true', 'y_pred', 'loss'] + tv_cols + tvs_cols]
+        df_explain['dataset'] = self.dataset
+        explain_file_name = f'explanation_test_{self.dataset}.explain_n-{cfg.explain_n}.mode-{cfg.explain_mode}.csv'
+        df_explain.to_csv(os.path.join(self.model_path, explain_file_name))
+        print('saved explanations to', os.path.join(self.model_path, explain_file_name))
+    finally:
+        self.split = original_split
+        self.explain_tasks = original_explain_tasks

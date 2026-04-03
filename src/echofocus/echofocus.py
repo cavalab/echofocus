@@ -10,6 +10,7 @@ import json
 import csv
 import h5py
 import ast
+from dataclasses import asdict
 
 import torch
 import time
@@ -42,7 +43,8 @@ from .checkpoints import (
     load_model_and_random_state,
     save_nn,
 )
-from .state import RunState, RuntimeConfig
+from .state import RuntimeConfig
+from .state import EvaluateConfig, EmbedConfig, ExplainConfig, TrainPingPongConfig
 
 
 class EchoFocus:
@@ -265,74 +267,28 @@ class EchoFocus:
 
         self._load_config()
         self._set_loss()
+        self.operation_configs = {}
         self.runtime_config = self._build_runtime_config()
-        self.run_state = self._build_run_state()
 
     def _build_runtime_config(self):
-        """Capture user/config inputs in a smaller structured object."""
-        tracked_keys = (
-            "model_name",
-            "dataset",
-            "task",
-            "seed",
-            "batch_number",
-            "batch_size",
-            "total_epochs",
-            "epoch_early_stop",
-            "learning_rate",
-            "encoder_depth",
-            "clip_dropout",
-            "tf_combine",
-            "parallel_processes",
-            "sample_limit",
-            "config",
-            "split",
-            "cache_video_tensors",
-            "cache_panecho_embeddings",
-            "end_to_end",
-            "panecho_trainable",
-            "transformer_trainable",
-            "load_transformer_path",
-            "load_panecho_path",
-            "load_strict",
-            "num_clips",
-            "clip_len",
-            "use_hdf5_index",
-            "label_path",
-            "embedding_path",
-            "video_base_path",
-            "video_subdir_format",
-            "max_videos_per_study",
-            "max_video_cache_gb",
-            "max_panecho_cache_gb",
-            "amp",
-            "checkpoint_panecho",
-            "profile",
-            "profile_steps",
-            "profile_dir",
-            "gpu_monitor",
-            "gpu_monitor_interval",
-            "ram_monitor",
-            "ram_monitor_interval",
-            "sharing_strategy",
-        )
-        extras = {
-            key: value
-            for key, value in vars(self).items()
-            if key not in tracked_keys
-            and key not in {"runtime_config", "run_state", "model", "optimizer", "scheduler", "scaler"}
-        }
+        """Capture the resolved, stable configuration for this run."""
         return RuntimeConfig(
+            run_id=self.run_id,
+            datetime=self.datetime,
+            model_path=self.model_path,
             model_name=self.model_name,
             dataset=self.dataset,
             task=self.task,
             seed=self.seed,
+            batch_number=self.batch_number,
+            batch_size=self.batch_size,
             split=tuple(self.split),
             total_epochs=self.total_epochs,
             epoch_early_stop=self.epoch_early_stop,
             learning_rate=self.learning_rate,
             encoder_depth=self.encoder_depth,
             clip_dropout=self.clip_dropout,
+            tf_combine=self.tf_combine,
             parallel_processes=self.parallel_processes,
             sample_limit=self.sample_limit,
             config_path=self.config,
@@ -341,31 +297,43 @@ class EchoFocus:
             transformer_trainable=self.transformer_trainable,
             load_transformer_path=self.load_transformer_path,
             load_panecho_path=self.load_panecho_path,
+            load_strict=self.load_strict,
+            use_hdf5_index=self.use_hdf5_index,
             label_path=self.label_path,
             embedding_path=self.embedding_path,
             video_base_path=self.video_base_path,
             video_subdir_format=self.video_subdir_format,
+            max_videos_per_study=self.max_videos_per_study,
             num_clips=self.num_clips,
             clip_len=self.clip_len,
             cache_video_tensors=self.cache_video_tensors,
             cache_panecho_embeddings=self.cache_panecho_embeddings,
+            max_video_cache_gb=self.max_video_cache_gb,
+            max_panecho_cache_gb=self.max_panecho_cache_gb,
             amp=self.amp,
             checkpoint_panecho=self.checkpoint_panecho,
+            profile=self.profile,
+            profile_steps=self.profile_steps,
+            profile_dir=self.profile_dir,
+            gpu_monitor=self.gpu_monitor,
+            gpu_monitor_interval=self.gpu_monitor_interval,
+            ram_monitor=self.ram_monitor,
+            ram_monitor_interval=self.ram_monitor_interval,
+            sharing_strategy=self.sharing_strategy,
+            task_labels=tuple(self.task_labels),
+            loss_name=getattr(self.loss_fn, "__name__", self.loss_fn.__class__.__name__),
             cli_overrides=tuple(sorted(self._cli_overrides)),
-            extras=extras,
         )
 
-    def _build_run_state(self):
-        """Capture mutable runtime objects separately from configuration."""
-        return RunState(
-            run_id=self.run_id,
-            datetime=self.datetime,
-            model_path=self.model_path,
-            task_labels=list(self.task_labels),
-            input_norm_dict=getattr(self, "input_norm_dict", None),
-            loss_name=getattr(self.loss_fn, "__name__", self.loss_fn.__class__.__name__),
-            perf_log=list(getattr(self, "perf_log", [])),
-        )
+    def _record_operation_config(self, op_name, cfg):
+        """Persist the effective arguments for an operation invocation."""
+        payload = asdict(cfg)
+        setattr(self, f"last_{op_name}_config", cfg)
+        self.operation_configs[op_name] = payload
+        path = os.path.join(self.model_path, f"{op_name}_config.json")
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=2)
+        return cfg
 
     def _start_gpu_monitor(self):
         return monitoring_ops.start_gpu_monitor(self)
@@ -444,6 +412,7 @@ class EchoFocus:
         """Load train args from the target run directory or source checkpoints."""
         train_args_path = os.path.join(self.model_path, 'train_args.csv')
         if self._apply_training_args_from_csv(train_args_path):
+            self.runtime_config = self._build_runtime_config()
             return
 
         source_paths = [self.load_transformer_path, self.load_panecho_path]
@@ -456,6 +425,7 @@ class EchoFocus:
                 continue
             seen.add(candidate)
             if self._apply_training_args_from_csv(candidate):
+                self.runtime_config = self._build_runtime_config()
                 return
 
     def _bootstrap_inference_checkpoint(self, model, input_norm_dict=None):
@@ -643,7 +613,6 @@ class EchoFocus:
             epoch_hook=epoch_hook,
         )
 
-    @utils.initializer
     def train_ping_pong(
         self,
         total_epochs=10,
@@ -652,13 +621,19 @@ class EchoFocus:
         transformer_lr=None,
         panecho_lr=None,
     ):
+        cfg = self._record_operation_config(
+            "train_ping_pong",
+            TrainPingPongConfig(
+                total_epochs=total_epochs,
+                start_with=start_with,
+                switch_every=switch_every,
+                transformer_lr=transformer_lr,
+                panecho_lr=panecho_lr,
+            ),
+        )
         return training_ops.train_ping_pong(
             self,
-            total_epochs=total_epochs,
-            start_with=start_with,
-            switch_every=switch_every,
-            transformer_lr=transformer_lr,
-            panecho_lr=panecho_lr,
+            cfg,
         )
     def _evaluate(self, model, dataloader, fold, input_norm_dict=None):
         return evaluation_ops.evaluate_fold(self, model, dataloader, fold, input_norm_dict=input_norm_dict)
@@ -688,7 +663,16 @@ class EchoFocus:
         
             
     def evaluate(self, split=None, folds=('train', 'val', 'test')):
-        return evaluation_ops.evaluate(self, split=split, folds=folds)
+        if isinstance(folds, str):
+            folds = (folds,)
+        cfg = self._record_operation_config(
+            "evaluate",
+            EvaluateConfig(
+                split=split,
+                folds=tuple(folds),
+            ),
+        )
+        return evaluation_ops.evaluate(self, cfg)
 
     def _set_loss(self):
         """Set the loss function based on task type."""
@@ -697,27 +681,37 @@ class EchoFocus:
         elif self.task in ['chd','fyler']:
             self.loss_fn = torch.nn.BCEWithLogitsLoss()
 
-    @utils.initializer
     def embed(self, embed_file=None, split=(0,0,100)):
-        return evaluation_ops.embed(self, embed_file=embed_file, split=split)
+        cfg = self._record_operation_config(
+            "embed",
+            EmbedConfig(
+                embed_file=embed_file,
+                split=tuple(split),
+            ),
+        )
+        return evaluation_ops.embed(self, cfg)
 
-    @utils.initializer
     def explain(
         self,
-        explain=False,
         explain_n=5,
         explain_mode='pred',
         explain_tasks = ('EF05','AR01'),
         split=(0,0,100)
     ):
-        return evaluation_ops.explain(
-            self,
-            explain=explain,
-            explain_n=explain_n,
-            explain_mode=explain_mode,
-            explain_tasks=explain_tasks,
-            split=split,
+        if isinstance(explain_tasks, str):
+            explain_tasks_value = explain_tasks
+        else:
+            explain_tasks_value = tuple(explain_tasks)
+        cfg = self._record_operation_config(
+            "explain",
+            ExplainConfig(
+                explain_n=explain_n,
+                explain_mode=explain_mode,
+                explain_tasks=explain_tasks_value,
+                split=tuple(split),
+            ),
         )
+        return evaluation_ops.explain(self, cfg)
 
     def save_log(self):
         return training_ops.save_log(self)
