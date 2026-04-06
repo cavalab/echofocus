@@ -230,7 +230,6 @@ class EchoFocus:
         self._set_loss()
         self.operation_configs = {}
         self.runtime_config = self._build_runtime_config()
-        self._save_runtime_config()
 
     def _build_runtime_config(self):
         """Capture the resolved, stable configuration for this run."""
@@ -296,11 +295,13 @@ class EchoFocus:
         stem, ext = os.path.splitext(basename)
         return os.path.join(history_dir, f"{stem}.{self.run_id}{ext}")
 
-    def _save_runtime_config(self):
+    def _save_runtime_config(self, canonical=True, history=True):
         """Persist the resolved run configuration to the model directory."""
         payload = asdict(self.runtime_config)
-        self._write_json(os.path.join(self.model_path, "runtime_config.json"), payload)
-        self._write_json(self._history_path("runtime_config.json"), payload)
+        if canonical:
+            self._write_json(os.path.join(self.model_path, "runtime_config.json"), payload)
+        if history:
+            self._write_json(self._history_path("runtime_config.json"), payload)
 
     def _record_operation_config(self, op_name, cfg):
         """Persist the effective arguments for an operation invocation."""
@@ -343,6 +344,108 @@ class EchoFocus:
         perf_log = ckpt.get("perf_log")
         input_norm_dict = ckpt.get("input_norm_dict")
         return perf_log, input_norm_dict
+
+    def _set_inference_metadata(self, key, value, source):
+        current = getattr(self, key, None)
+        if key in self._cli_overrides:
+            print(f"WARNING: ignoring CLI arg {key}={current}; using {value} from {source} for inference")
+        if current != value:
+            print(f"WARNING: using {key}={value}, loaded from {source}")
+            setattr(self, key, value)
+            return True
+        return False
+
+    def _apply_architecture_from_checkpoint(self, checkpoint_path):
+        """Infer model architecture fields directly from checkpoint state dict keys."""
+        if not checkpoint_path or not os.path.isfile(checkpoint_path):
+            return False
+
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        state = ckpt.get("model_state_dict", ckpt)
+        keys = list(state.keys())
+        if not keys:
+            return False
+
+        prefix = "transformer." if any(k.startswith("transformer.") for k in keys) else ""
+        updated = False
+
+        if any(k.startswith("panecho.") for k in keys):
+            updated |= self._set_inference_metadata("end_to_end", True, checkpoint_path)
+        else:
+            updated |= self._set_inference_metadata("end_to_end", False, checkpoint_path)
+
+        if any(k.startswith(prefix + "query_tokens") for k in keys):
+            transformer_type = "multiquery"
+        elif any(k.startswith(prefix + "query_token") for k in keys):
+            transformer_type = "query"
+        else:
+            transformer_type = "standard"
+        updated |= self._set_inference_metadata("transformer_type", transformer_type, checkpoint_path)
+
+        layer_prefix = prefix + "encoder.layers."
+        layer_indices = []
+        for key in keys:
+            if not key.startswith(layer_prefix):
+                continue
+            remainder = key[len(layer_prefix):]
+            layer_idx = remainder.split(".", 1)[0]
+            if layer_idx.isdigit():
+                layer_indices.append(int(layer_idx))
+        encoder_depth = max(layer_indices) + 1 if layer_indices else 0
+        updated |= self._set_inference_metadata("encoder_depth", encoder_depth, checkpoint_path)
+
+        self.runtime_config = self._build_runtime_config()
+        return updated
+
+    def _apply_inference_metadata_from_csv(self, train_args_path):
+        if not os.path.isfile(train_args_path):
+            return False
+
+        train_args = pd.read_csv(train_args_path).to_dict(orient='records')[0]
+        updated = False
+        if 'clip_dropout' in train_args and pd.notna(train_args['clip_dropout']):
+            updated |= self._set_inference_metadata('clip_dropout', float(train_args['clip_dropout']), train_args_path)
+        if 'target_label_list' in train_args:
+            value = train_args['target_label_list']
+            if isinstance(value, str):
+                value = ast.literal_eval(value)
+            updated |= self._set_inference_metadata('task_labels', value, train_args_path)
+        elif 'task_labels' in train_args:
+            value = train_args['task_labels']
+            if isinstance(value, str):
+                value = ast.literal_eval(value)
+            updated |= self._set_inference_metadata('task_labels', value, train_args_path)
+        self.runtime_config = self._build_runtime_config()
+        return updated
+
+    def _apply_inference_metadata_from_runtime_config(self, runtime_config_path):
+        if not os.path.isfile(runtime_config_path):
+            return False
+
+        with open(runtime_config_path, "r") as f:
+            runtime_cfg = json.load(f)
+
+        updated = False
+        if 'clip_dropout' in runtime_cfg:
+            updated |= self._set_inference_metadata('clip_dropout', runtime_cfg['clip_dropout'], runtime_config_path)
+        if 'task_labels' in runtime_cfg:
+            value = runtime_cfg['task_labels']
+            if isinstance(value, tuple):
+                value = list(value)
+            updated |= self._set_inference_metadata('task_labels', value, runtime_config_path)
+        self.runtime_config = self._build_runtime_config()
+        return updated
+
+    def _get_preferred_inference_checkpoint_path(self):
+        if os.path.isfile(self.best_checkpoint_path):
+            return self.best_checkpoint_path
+        if os.path.isfile(self.last_checkpoint_path):
+            return self.last_checkpoint_path
+        if self.load_transformer_path:
+            return self.load_transformer_path
+        if self.load_panecho_path:
+            return self.load_panecho_path
+        return None
 
     def _apply_training_args_from_csv(self, train_args_path):
         """Apply key architecture settings from a saved training-args CSV."""
@@ -479,10 +582,23 @@ class EchoFocus:
 
     def _load_inference_model(self):
         """Return an inference-ready model and normalization metadata."""
-        model, _, _, _, input_norm_dict = self._setup_model()
+        checkpoint_path = self._get_preferred_inference_checkpoint_path()
+        self._apply_architecture_from_checkpoint(checkpoint_path)
+        self._apply_inference_metadata_from_csv(os.path.join(self.model_path, 'train_args.csv'))
+        self._apply_inference_metadata_from_runtime_config(os.path.join(self.model_path, 'runtime_config.json'))
+        model, _, _, _, input_norm_dict = self._setup_model(
+            resume_training_state=False,
+            load_saved_architecture=False,
+        )
         if os.path.isfile(self.best_checkpoint_path):
             best_model, _, _, _, input_norm_dict = load_model_and_random_state(
                 self.best_checkpoint_path,
+                model,
+            )
+            return best_model, input_norm_dict
+        if os.path.isfile(self.last_checkpoint_path):
+            best_model, _, _, _, input_norm_dict = load_model_and_random_state(
+                self.last_checkpoint_path,
                 model,
             )
             return best_model, input_norm_dict
@@ -567,8 +683,12 @@ class EchoFocus:
 
     # def _normalize_data(self):
 
-    def _setup_model(self):
-        return training_ops.setup_model(self)
+    def _setup_model(self, resume_training_state=True, load_saved_architecture=True):
+        return training_ops.setup_model(
+            self,
+            resume_training_state=resume_training_state,
+            load_saved_architecture=load_saved_architecture,
+        )
 
     # def load_checkpoint(self, checkpoint):
 

@@ -25,14 +25,18 @@ def set_trainable_flags(self):
             param.requires_grad = bool(self.transformer_trainable)
 
 
-def setup_model(self):
+def setup_model(self, resume_training_state=True, load_saved_architecture=True):
     """Initialize model, optimizer, scheduler, and load checkpoints."""
     print('_setup_model...')
     self.last_checkpoint_path = os.path.join(self.model_path, 'last_checkpoint.pt')
     self.best_checkpoint_path = os.path.join(self.model_path, 'best_checkpoint.pt')
     self.log_path = os.path.join(self.model_path, 'train_losses.csv')
 
-    self._maybe_apply_source_train_args()
+    if load_saved_architecture:
+        self._maybe_apply_source_train_args()
+    if resume_training_state:
+        self.runtime_config = self._build_runtime_config()
+        self._save_runtime_config()
 
     if self.end_to_end:
         self.model = EchoFocusEndToEnd(
@@ -92,7 +96,7 @@ def setup_model(self):
 
     self.perf_log = []
     input_norm_dict = None
-    if os.path.isfile(self.last_checkpoint_path):
+    if resume_training_state and os.path.isfile(self.last_checkpoint_path):
         print('loading lastcheckpoint')
         self.model, self.optimizer, self.scheduler, self.perf_log, input_norm_dict = load_model_and_random_state(
             self.last_checkpoint_path,
