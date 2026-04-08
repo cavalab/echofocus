@@ -1,0 +1,93 @@
+experiment_name: end2end
+operation: train_ping_pong
+dataset: bch_internal
+base_model_name: echofocus_e2e
+seeds_file: seeds.txt
+ntrials: 1
+
+account: chip-lacava
+partition: gpu-chip-lacava,bch-gpu,bch-gpu-pe
+gpus: 1
+time_limit: "7-00:00:00"
+ntasks: 1
+cpus_per_task: 8
+mem: 600G
+qos: normal
+
+command_prefix: uv run
+cli_script: echofocus
+jobs_dir: slurm_jobs
+logs_dir: slurm_logs
+
+tasks:
+  - chd
+  - fyler
+  - measure
+
+transformer_types:
+  - customtransformer
+  - query
+  - multiquery
+
+learning_rates:
+  - 1.0e-4
+  - 3.0e-4
+  - 1.0e-3
+
+max_videos_per_study:
+  - null
+  - 25
+  - 50
+
+train_args:
+  config: config.json
+  end_to_end: true
+  cache_panecho_embeddings: true
+  use_hdf5_index: true
+  batch_number: 1
+  total_epochs: 100
+  epoch_early_stop: 10
+  amp: true
+  checkpoint_panecho: true
+  parallel_processes: 4
+  gpu_monitor: true
+  ram_monitor: true
+  panecho_trainable: true
+  transformer_trainable: true
+
+submit: false
+print_only: false
+
+experiments:
+  - experiment_name: end2end_len16_d0
+    train_args:
+      encoder_depth: 0
+    num_clips:
+      - 1
+      - 4
+      - 16
+    clip_lengths:
+      - 16
+  - experiment_name: end2end_len16_d1
+    train_args:
+      encoder_depth: 1
+    num_clips:
+      - 1
+      - 4
+      - 16
+    clip_lengths:
+      - 16
+  - experiment_name: end2end_len32_d0
+    train_args:
+      encoder_depth: 0
+    num_clips:
+      - 1
+    clip_lengths:
+      - 32
+  - experiment_name: end2end_len32_d1
+    train_args:
+      encoder_depth: 1
+    num_clips:
+      - 1
+    clip_lengths:
+      - 32

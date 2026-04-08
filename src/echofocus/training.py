@@ -206,6 +206,15 @@ def run_training_loop(
         max_alloc = torch.cuda.max_memory_allocated() / 1024**3
         print(f"[mem] {tag}: alloc={alloc:.2f}G reserved={reserved:.2f}G max={max_alloc:.2f}G")
 
+    def _backoff_lr(factor=0.5, min_lr=1e-7):
+        new_lrs = []
+        for param_group in self.optimizer.param_groups:
+            current_lr = float(param_group["lr"])
+            updated_lr = max(current_lr * factor, min_lr)
+            param_group["lr"] = updated_lr
+            new_lrs.append(updated_lr)
+        return new_lrs
+
     global_step = 0
     prev_batch_end = None
     while (current_epoch < self.total_epochs) and (current_epoch - best_epoch < self.epoch_early_stop):
@@ -264,6 +273,15 @@ def run_training_loop(
                 else:
                     out = self.model(embedding)
                 train_loss = self.loss_fn(out, correct_out)
+            if not torch.isfinite(train_loss):
+                reduced_lrs = _backoff_lr()
+                self.model.zero_grad(set_to_none=True)
+                print(
+                    "WARNING: non-finite train loss detected; skipping batch and reducing lr to "
+                    f"{reduced_lrs}"
+                )
+                prev_batch_end = time.time()
+                continue
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             t_fwd_end = time.time()
