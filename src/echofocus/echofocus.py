@@ -437,10 +437,12 @@ class EchoFocus:
         return updated
 
     def _get_preferred_inference_checkpoint_path(self):
-        if os.path.isfile(self.best_checkpoint_path):
-            return self.best_checkpoint_path
-        if os.path.isfile(self.last_checkpoint_path):
-            return self.last_checkpoint_path
+        best_checkpoint_path = os.path.join(self.model_path, "best_checkpoint.pt")
+        last_checkpoint_path = os.path.join(self.model_path, "last_checkpoint.pt")
+        if os.path.isfile(best_checkpoint_path):
+            return best_checkpoint_path
+        if os.path.isfile(last_checkpoint_path):
+            return last_checkpoint_path
         if self.load_transformer_path:
             return self.load_transformer_path
         if self.load_panecho_path:
