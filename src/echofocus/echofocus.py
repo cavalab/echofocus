@@ -286,6 +286,8 @@ class EchoFocus:
         )
 
     def _write_json(self, path, payload):
+        if isinstance(payload, dict) and "run_id" not in payload and hasattr(self, "run_id"):
+            payload = {"run_id": self.run_id, **payload}
         with open(path, "w") as f:
             json.dump(payload, f, indent=2)
 

@@ -500,5 +500,6 @@ def save_log(self):
 
     with open(self.log_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["epochs_trained", "train_loss", "val_loss", "lr", "epoch_time"])
-        writer.writerows(self.perf_log)
+        writer.writerow(["run_id", "epochs_trained", "train_loss", "val_loss", "lr", "epoch_time"])
+        for row in self.perf_log:
+            writer.writerow([self.run_id, *row])

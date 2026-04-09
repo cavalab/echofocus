@@ -73,7 +73,11 @@ def evaluate_fold(self, model, dataloader, fold, input_norm_dict=None):
         data_df = dataloader.dataset.dataframe
     pids = data_df.loc[eids]['pid'].values
     eids = np.array(eids)
-    saveout_df = pd.DataFrame({'PID': pids, 'Echo_ID': eids})
+    saveout_df = pd.DataFrame({
+        'run_id': self.run_id,
+        'PID': pids,
+        'Echo_ID': eids,
+    })
     for i, _ in enumerate(self.task_labels):
         saveout_df[self.task_labels[i] + '_Correct'] = y_true[:, i]
         saveout_df[self.task_labels[i] + '_Predict'] = y_pred[:, i]
@@ -132,6 +136,8 @@ def get_metrics(self, fold='test', dataset=None, n_bootstrap=1000, model_name=No
     df = pd.read_csv(saveout_path)
     rng = np.random.default_rng(self.seed)
     out = {
+        'run_id': self.run_id,
+        'model_name': self.model_name,
         'task': self.task,
         'dataset': dataset,
         'fold': fold,

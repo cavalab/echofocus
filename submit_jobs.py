@@ -133,6 +133,7 @@ class SubmitJobs:
             "multiquery",
         ),
         learning_rates: list[float] | tuple[float, ...] = (1e-4, 3e-4, 1e-3),
+        encoder_depths: list[int] | tuple[int, ...] = (0,),
         num_clips: list[int] | tuple[int, ...] = (4, 8, 16),
         clip_lengths: list[int] | tuple[int, ...] = (16, 32),
         max_videos_per_study: list[int | None] | tuple[int | None, ...] = (
@@ -164,6 +165,7 @@ class SubmitJobs:
         tasks_list = _coerce_list(tasks, "tasks", str)
         transformer_list = _coerce_list(transformer_types, "transformer_types", str)
         lr_list = _coerce_list(learning_rates, "learning_rates", float)
+        encoder_depth_list = _coerce_list(encoder_depths, "encoder_depths", int)
         clips_list = _coerce_list(num_clips, "num_clips", int)
         clip_len_list = _coerce_list(clip_lengths, "clip_lengths", int)
         videos_list = [
@@ -178,6 +180,8 @@ class SubmitJobs:
             raise ValueError("At least one transformer type is required.")
         if not lr_list:
             raise ValueError("At least one learning rate is required.")
+        if not encoder_depth_list:
+            raise ValueError("At least one encoder depth is required.")
         if not clips_list:
             raise ValueError("At least one num_clips value is required.")
         if not clip_len_list:
@@ -200,12 +204,22 @@ class SubmitJobs:
             tasks_list,
             transformer_list,
             lr_list,
+            encoder_depth_list,
             clips_list,
             clip_len_list,
             videos_list,
         )
 
-        for seed, task, transformer, learning_rate, nclips, clip_len, max_videos in combos:
+        for (
+            seed,
+            task,
+            transformer,
+            learning_rate,
+            encoder_depth,
+            nclips,
+            clip_len,
+            max_videos,
+        ) in combos:
             normalized_transformer = _normalize_transformer_type(transformer)
             run_args = deepcopy(extra_train_args)
             run_args.update(
@@ -214,6 +228,7 @@ class SubmitJobs:
                     "task": task,
                     "seed": seed,
                     "learning_rate": learning_rate,
+                    "encoder_depth": encoder_depth,
                     "transformer_type": normalized_transformer,
                     "num_clips": nclips,
                     "clip_len": clip_len,
@@ -226,6 +241,7 @@ class SubmitJobs:
                 task=task,
                 transformer=transformer,
                 learning_rate=learning_rate,
+                encoder_depth=encoder_depth,
                 num_clips=nclips,
                 clip_len=clip_len,
                 max_videos_per_study=max_videos,
@@ -242,6 +258,7 @@ class SubmitJobs:
                 task=task,
                 transformer=transformer,
                 learning_rate=learning_rate,
+                encoder_depth=encoder_depth,
                 num_clips=nclips,
                 clip_len=clip_len,
                 max_videos_per_study=max_videos,
@@ -401,6 +418,7 @@ class SubmitJobs:
         task: str,
         transformer: str,
         learning_rate: float,
+        encoder_depth: int,
         num_clips: int,
         clip_len: int,
         max_videos_per_study: int | None,
@@ -410,7 +428,7 @@ class SubmitJobs:
         max_videos_token = "all" if max_videos_per_study is None else str(max_videos_per_study)
         return _sanitize_name(
             f"{experiment_name}_{task}_{transformer}"
-            f"_lr{lr_token}_clips{num_clips}_len{clip_len}"
+            f"_lr{lr_token}_d{encoder_depth}_clips{num_clips}_len{clip_len}"
             f"_mv{max_videos_token}_s{seed}"
         )
 
@@ -422,6 +440,7 @@ class SubmitJobs:
         task: str,
         transformer: str,
         learning_rate: float,
+        encoder_depth: int,
         num_clips: int,
         clip_len: int,
         max_videos_per_study: int | None,
@@ -431,7 +450,7 @@ class SubmitJobs:
         max_videos_token = "all" if max_videos_per_study is None else str(max_videos_per_study)
         return _sanitize_name(
             f"{base_model_name}_{experiment_name}_{task}_{transformer}"
-            f"_lr{lr_token}_clips{num_clips}_len{clip_len}"
+            f"_lr{lr_token}_d{encoder_depth}_clips{num_clips}_len{clip_len}"
             f"_mv{max_videos_token}_s{seed}"
         )
 
