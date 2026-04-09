@@ -8,8 +8,8 @@ ntrials: 1
 account: chip-lacava
 partition: gpu-chip-lacava,bch-gpu,bch-gpu-pe
 gpus: 1
-# time_limit: "7-00:00:00"
-time_limit: "02:00:00"
+time_limit: "7-00:00:00"
+# time_limit: "02:00:00"
 ntasks: 1
 cpus_per_task: 8
 mem: 600G
@@ -32,7 +32,6 @@ transformer_types:
 
 learning_rates:
   - 1.0e-4
-  - 3.0e-4
   - 1.0e-3
 
 encoder_depths:
@@ -41,7 +40,6 @@ encoder_depths:
 
 max_videos_per_study:
   - null
-  - 50
 
 train_args:
   config: config.json
@@ -58,8 +56,7 @@ train_args:
   panecho_trainable: true
   transformer_trainable: true
   panecho_lr_ratio: 0.1
-  total_epochs: 1
-  sample_limit: 1000
+  total_epochs: 100
 
 submit: false
 print_only: false
