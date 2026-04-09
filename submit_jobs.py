@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import itertools
 import json
+import os
 import re
 import shlex
 import subprocess
+import time
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
@@ -158,6 +160,9 @@ class SubmitJobs:
         jobs_dir: str = "slurm_jobs",
         logs_dir: str = "slurm_logs",
         venv_activate: str | None = None,
+        skip_existing_jobs: bool = True,
+        submit_retries: int = 3,
+        submit_retry_delay_sec: float = 5.0,
         submit: bool = False,
         print_only: bool = False,
     ):
@@ -198,6 +203,8 @@ class SubmitJobs:
 
         created_scripts: list[Path] = []
         submitted_job_ids: list[str] = []
+        skipped_job_names: list[str] = []
+        active_job_names = self._get_active_job_names() if (submit and skip_existing_jobs) else set()
 
         combos = itertools.product(
             seeds,
@@ -286,28 +293,20 @@ class SubmitJobs:
                 print(f"[{job_name}] {command_str}")
                 continue
 
+            if submit and skip_existing_jobs and job_name in active_job_names:
+                skipped_job_names.append(job_name)
+                print(f"skipping existing active job {job_name}")
+                continue
+
             if submit:
-                sbatch_cmd = ["sbatch", str(script_path)]
-                try:
-                    proc = subprocess.run(
-                        sbatch_cmd,
-                        check=True,
-                        capture_output=True,
-                        text=True,
-                    )
-                except subprocess.CalledProcessError as exc:
-                    stdout = (exc.stdout or "").strip()
-                    stderr = (exc.stderr or "").strip()
-                    raise RuntimeError(
-                        "sbatch failed for "
-                        f"{script_path}\n"
-                        f"command: {' '.join(sbatch_cmd)}\n"
-                        f"stdout: {stdout or '<empty>'}\n"
-                        f"stderr: {stderr or '<empty>'}"
-                    ) from exc
-                output = proc.stdout.strip()
-                job_id = output.split()[-1] if output else ""
+                job_id, output = self._submit_with_retries(
+                    script_path=script_path,
+                    job_name=job_name,
+                    submit_retries=submit_retries,
+                    submit_retry_delay_sec=submit_retry_delay_sec,
+                )
                 submitted_job_ids.append(job_id)
+                active_job_names.add(job_name)
                 print(f"submitted {script_path} -> {output}")
             else:
                 print(f"generated {script_path}")
@@ -316,11 +315,14 @@ class SubmitJobs:
         if submit and submitted_job_ids:
             print(f"submitted_jobs={len(submitted_job_ids)}")
             print(f"job_ids={','.join(submitted_job_ids)}")
+        if skipped_job_names:
+            print(f"skipped_existing_jobs={len(skipped_job_names)}")
         return {
             "total_jobs": len(created_scripts),
             "jobs_dir": str(jobs_path),
             "logs_dir": str(logs_path),
             "submitted_job_ids": submitted_job_ids,
+            "skipped_job_names": skipped_job_names,
         }
 
     def run_config(
@@ -348,6 +350,7 @@ class SubmitJobs:
         all_job_ids: list[str] = []
         total_jobs = 0
         results = []
+        skipped_job_names: list[str] = []
         for experiment in experiments:
             if not isinstance(experiment, dict):
                 raise ValueError("Each entry in 'experiments' must be a dictionary.")
@@ -363,13 +366,104 @@ class SubmitJobs:
             result = self.run(**merged)
             total_jobs += int(result["total_jobs"])
             all_job_ids.extend(result["submitted_job_ids"])
+            skipped_job_names.extend(result.get("skipped_job_names", []))
             results.append(result)
 
         return {
             "total_jobs": total_jobs,
             "submitted_job_ids": all_job_ids,
+            "skipped_job_names": skipped_job_names,
             "experiments": results,
         }
+
+    @staticmethod
+    def _get_active_job_names() -> set[str]:
+        """Return currently active Slurm job names for the current user."""
+        cmd = ["squeue", "-h", "-u", os.environ.get("USER", ""), "-o", "%j"]
+        try:
+            proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return set()
+        return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+
+    @classmethod
+    def _find_active_job_id(cls, job_name: str) -> str | None:
+        """Return the active Slurm job ID for a job name when present."""
+        cmd = ["squeue", "-h", "-u", os.environ.get("USER", ""), "-o", "%A|%j"]
+        try:
+            proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return None
+        for line in proc.stdout.splitlines():
+            job_id, _, queued_name = line.partition("|")
+            if queued_name.strip() == job_name:
+                return job_id.strip() or None
+        return None
+
+    @classmethod
+    def _submit_with_retries(
+        cls,
+        *,
+        script_path: Path,
+        job_name: str,
+        submit_retries: int,
+        submit_retry_delay_sec: float,
+    ) -> tuple[str, str]:
+        """Submit a Slurm job, retrying transient failures without duplicating jobs."""
+        sbatch_cmd = ["sbatch", str(script_path)]
+        last_exc: subprocess.CalledProcessError | None = None
+
+        for attempt in range(max(1, int(submit_retries))):
+            try:
+                proc = subprocess.run(
+                    sbatch_cmd,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                output = proc.stdout.strip()
+                job_id = output.split()[-1] if output else ""
+                return job_id, output
+            except subprocess.CalledProcessError as exc:
+                last_exc = exc
+                stdout = (exc.stdout or "").strip()
+                stderr = (exc.stderr or "").strip()
+                active_job_id = cls._find_active_job_id(job_name)
+                if active_job_id is not None:
+                    return active_job_id, f"Detected existing active job {active_job_id} after sbatch error"
+                is_last_attempt = attempt >= max(1, int(submit_retries)) - 1
+                if is_last_attempt or not cls._is_retryable_sbatch_error(stderr):
+                    raise RuntimeError(
+                        "sbatch failed for "
+                        f"{script_path}\n"
+                        f"command: {' '.join(sbatch_cmd)}\n"
+                        f"stdout: {stdout or '<empty>'}\n"
+                        f"stderr: {stderr or '<empty>'}"
+                    ) from exc
+                wait_seconds = float(submit_retry_delay_sec) * (attempt + 1)
+                print(
+                    f"sbatch transient failure for {job_name}; "
+                    f"retrying in {wait_seconds:.1f}s ({attempt + 1}/{submit_retries})"
+                )
+                time.sleep(wait_seconds)
+
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError(f"sbatch failed unexpectedly for {script_path}")
+
+    @staticmethod
+    def _is_retryable_sbatch_error(stderr: str) -> bool:
+        """Return True when an sbatch failure looks transient."""
+        message = stderr.lower()
+        retryable_patterns = (
+            "socket timed out",
+            "connection timed out",
+            "temporarily unavailable",
+            "unable to contact slurm controller",
+            "slurm temporarily unable",
+            "i/o error writing script/environment to file",
+        )
+        return any(pattern in message for pattern in retryable_patterns)
 
     @staticmethod
     def _load_seeds(seeds_file: str, ntrials: int) -> list[int]:
