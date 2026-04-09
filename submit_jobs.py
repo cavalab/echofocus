@@ -156,7 +156,7 @@ class SubmitJobs:
         mem: str = "600G",
         qos: str | None = "normal",
         command_prefix: str = "uv run",
-        cli_script: str = "echofocus.py",
+        cli_script: str = "echofocus",
         jobs_dir: str = "slurm_jobs",
         logs_dir: str = "slurm_logs",
         venv_activate: str | None = None,
