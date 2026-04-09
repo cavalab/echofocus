@@ -445,6 +445,8 @@ def train_ping_pong(self, cfg):
     """Alternate training between transformer-only and PanEcho-only phases."""
     if cfg.start_with not in ("transformer", "panecho"):
         raise ValueError("start_with must be 'transformer' or 'panecho'")
+    if cfg.panecho_lr_ratio <= 0:
+        raise ValueError("panecho_lr_ratio must be > 0")
     smoke_steps = None
     if self.smoke_train:
         if cfg.total_epochs < 1:
@@ -471,12 +473,12 @@ def train_ping_pong(self, cfg):
             print(f"phase: transformer-only epoch {epoch}")
             self.panecho_trainable = False
             self.transformer_trainable = True
-            self.learning_rate = cfg.transformer_lr if cfg.transformer_lr is not None else orig_lr
+            self.learning_rate = orig_lr
         else:
             print(f"phase: panecho-only epoch {epoch}")
             self.panecho_trainable = True
             self.transformer_trainable = False
-            self.learning_rate = cfg.panecho_lr if cfg.panecho_lr is not None else orig_lr
+            self.learning_rate = orig_lr * cfg.panecho_lr_ratio
 
     self._run_training_loop(
         model,

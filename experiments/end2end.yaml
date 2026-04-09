@@ -54,6 +54,7 @@ train_args:
   ram_monitor: true
   panecho_trainable: true
   transformer_trainable: true
+  panecho_lr_ratio: 0.1
 
 submit: false
 print_only: false

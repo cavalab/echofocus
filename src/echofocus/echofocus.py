@@ -729,8 +729,7 @@ class EchoFocus:
         total_epochs=10,
         start_with="transformer",
         switch_every=1,
-        transformer_lr=None,
-        panecho_lr=None,
+        panecho_lr_ratio=0.1,
     ):
         cfg = self._record_operation_config(
             "train_ping_pong",
@@ -738,8 +737,7 @@ class EchoFocus:
                 total_epochs=total_epochs,
                 start_with=start_with,
                 switch_every=switch_every,
-                transformer_lr=transformer_lr,
-                panecho_lr=panecho_lr,
+                panecho_lr_ratio=panecho_lr_ratio,
             ),
         )
         return training_ops.train_ping_pong(

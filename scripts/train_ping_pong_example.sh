@@ -29,6 +29,7 @@ uv run echofocus train_ping_pong \
   --checkpoint_panecho \
   --use_hdf5_index \
   --parallel_processes 4 \
+  --panecho_lr_ratio 0.1 \
   --gpu_monitor \
   --ram_monitor \
   --max_videos_per_study 50

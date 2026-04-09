@@ -335,7 +335,14 @@ class SubmitJobs:
             if not isinstance(experiment, dict):
                 raise ValueError("Each entry in 'experiments' must be a dictionary.")
             merged = deepcopy(shared)
+            shared_train_args = deepcopy(merged.get("train_args", {}))
+            experiment_train_args = deepcopy(experiment.get("train_args", {}))
             merged.update(experiment)
+            if shared_train_args or experiment_train_args:
+                merged["train_args"] = {
+                    **shared_train_args,
+                    **experiment_train_args,
+                }
             result = self.run(**merged)
             total_jobs += int(result["total_jobs"])
             all_job_ids.extend(result["submitted_job_ids"])

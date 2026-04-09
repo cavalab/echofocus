@@ -93,5 +93,4 @@ class TrainPingPongConfig:
     total_epochs: int = 10
     start_with: str = "transformer"
     switch_every: int = 1
-    transformer_lr: Optional[float] = None
-    panecho_lr: Optional[float] = None
+    panecho_lr_ratio: float = 0.1

@@ -52,6 +52,7 @@ train_args:
   ram_monitor: false
   panecho_trainable: true
   transformer_trainable: true
+  panecho_lr_ratio: 0.1
   smoke_train: true
   smoke_num_steps: 1
   sample_limit: 32
